@@ -5,6 +5,7 @@ import datetime as dt
 import os
 import signal
 import threading
+import traceback
 from pathlib import Path
 from typing import List, Optional
 
@@ -148,7 +149,13 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 continue
 
             # --- normal turn ---
-            ans, proactive = agent.handle(user)
+            try:
+                ans, proactive = agent.handle(user)
+            except Exception as e:
+                print(f"bot> ERROR: {e}")
+                traceback.print_exc()
+                continue
+
             print(f"bot> {ans}")
             for pm in proactive:
                 print(f"\n[initiative score={pm['score']:.2f}] {pm['message']}\n")

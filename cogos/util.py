@@ -54,7 +54,7 @@ def extract_first_json_object(text: str) -> Dict[str, Any]:
 
     start = s.find("{")
     if start < 0:
-        raise ValueError("No JSON object found.")
+        raise ValueError(f"No JSON object found. Output snippet: {short(s, 400)}")
     depth = 0
     in_str = False
     esc = False
@@ -79,5 +79,4 @@ def extract_first_json_object(text: str) -> Dict[str, Any]:
                 if depth == 0:
                     chunk = s[start : i + 1]
                     return json.loads(chunk)
-    raise ValueError("Unbalanced JSON braces.")
-
+    raise ValueError(f"Unbalanced JSON braces. Output snippet: {short(s, 400)}")

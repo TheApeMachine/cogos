@@ -6,7 +6,6 @@ from typing import Any, Dict, List
 from .ir import Plan, PlanStep, StepMemorySearch, StepRespond, StepToolCall
 from .llm import ChatMessage, ChatModel
 from .memory import MemoryStore
-from .pyd_compat import BaseModel, Field
 from .tools import ToolBus
 from .util import jdump
 
@@ -54,9 +53,6 @@ class LLMPlanner(Planner):
     def __init__(self, model: ChatModel):
         self.model = model
 
-    class _Schema(BaseModel):
-        steps: List[Dict[str, Any]] = Field(default_factory=list)
-
     def plan(self, user_text: str, *, tools: ToolBus, memory: MemoryStore) -> Plan:  # noqa: ARG002
         compact_tools = []
         for t in tools.list_tools():
@@ -72,25 +68,47 @@ class LLMPlanner(Planner):
 
         sys = (
             "You are a planning compiler. Output JSON only.\n"
-            "Create a plan as a list of steps. Allowed step types:\n"
-            " - memory_search: {type:'memory_search', query, k}\n"
-            " - tool_call: {type:'tool_call', tool, arguments}\n"
-            " - write_note: {type:'write_note', title, content, tags, confidence}\n"
-            " - create_task: {type:'create_task', title, description, priority, payload}\n"
-            " - respond: {type:'respond', style}\n"
-            "Rules:\n"
-            "- Prefer memory_search first.\n"
-            "- Use tool_call when useful.\n"
-            "- Avoid side-effect tools unless required.\n"
-            "- Always end with respond.\n"
+            "Return a JSON object with this shape:\n"
+            "{\"steps\":[ ... ]}\n\n"
+            "Each step must be one of:\n"
+            "- memory_search: {\"type\":\"memory_search\",\"query\":str,\"k\":int}\n"
+            "- tool_call:    {\"type\":\"tool_call\",\"tool\":str,\"arguments\":object}\n"
+            "- write_note:   {\"type\":\"write_note\",\"title\":str,\"content\":str,\"tags\":[str],\"confidence\":number}\n"
+            "- create_task:  {\"type\":\"create_task\",\"title\":str,\"description\":str,\"priority\":int,\"payload\":object}\n"
+            "- respond:      {\"type\":\"respond\",\"style\":str}\n\n"
+            "Rules (hard):\n"
+            "- steps must be non-empty.\n"
+            "- The last step MUST be respond.\n"
+            "- arguments MUST be an object ({}), not a list.\n"
+            "- payload MUST be an object ({}), not a list.\n"
+            "- Use the exact key order shown in each step format.\n"
+            "- Do not add extra keys.\n"
+            "- Do NOT create_task or write_note unless the user explicitly asked.\n"
+            "- Avoid side-effect tools unless required.\n\n"
+            "Guidance:\n"
+            "- Use tool_call 'count_chars' for letter counting questions.\n\n"
+            "Examples:\n"
+            "User: hi\n"
+            "{\"steps\":[{\"type\":\"respond\",\"style\":\"helpful\"}]}\n\n"
+            "User: calculate 2+2\n"
+            "{\"steps\":[{\"type\":\"tool_call\",\"tool\":\"calc\",\"arguments\":{\"expression\":\"2+2\"}},{\"type\":\"respond\",\"style\":\"helpful\"}]}\n"
+            "\n"
+            "User: How many times is the letter r in the word strawberry?\n"
+            "{\"steps\":[{\"type\":\"tool_call\",\"tool\":\"count_chars\",\"arguments\":{\"text\":\"strawberry\",\"char\":\"r\",\"case_sensitive\":false}},{\"type\":\"respond\",\"style\":\"helpful\"}]}\n"
         )
         user = (
             "User request:\n"
             + user_text
             + "\n\nAvailable tools:\n"
             + jdump(compact_tools)
-            + "\n\nReturn {steps:[...]} only."
+            + "\n\nReturn JSON only."
         )
         msgs = [ChatMessage(role="system", content=sys), ChatMessage(role="user", content=user)]
-        raw = self.model.generate_json(msgs, self._Schema, temperature=0.1, max_tokens=900)
-        return Plan(steps=raw.steps)  # pydantic validates union
+        plan = self.model.generate_json(msgs, Plan, temperature=0.1, max_tokens=900)
+        if not isinstance(plan, Plan):
+            raise TypeError(f"LLMPlanner expected Plan, got {type(plan).__name__}")
+        if not plan.steps:
+            raise ValueError("LLMPlanner returned an empty plan (no steps).")
+        if not isinstance(plan.steps[-1], StepRespond):
+            raise ValueError("LLMPlanner plan must end with a respond step.")
+        return plan

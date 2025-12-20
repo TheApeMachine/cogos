@@ -94,9 +94,9 @@ class LLMReasoner(Reasoner):
         kind: Literal["fact", "math", "inference"] = "fact"
 
     class _Schema(BaseModel):
-        claims: List["LLMReasoner._RawClaim"] = Field(default_factory=list)
-        draft: str = ""
-        proactive: List[Dict[str, Any]] = Field(default_factory=list)
+        claims: List["LLMReasoner._RawClaim"]
+        draft: str
+        proactive: List[Dict[str, Any]]
 
     def propose(
         self,
@@ -113,24 +113,34 @@ class LLMReasoner(Reasoner):
             return s if len(s) <= n else s[:n]
 
         blocks: List[str] = []
-        for eid, txt in list(evidence_map.items())[:12]:
-            blocks.append(f"[{eid}]\n{_ev_excerpt(txt, 4000)}")
+        for eid, txt in list(evidence_map.items())[:8]:
+            blocks.append(f"[{eid}]\n{_ev_excerpt(txt, 1400)}")
 
         sys = (
             "You are a reasoning compiler. Output JSON only.\n"
             "Goal: answer the user using atomic claims grounded in evidence.\n\n"
             "Rules (hard):\n"
+            "- Output must be small: at most 3 claims.\n"
+            "- Each claim MUST cite exactly 1 evidence_id.\n"
+            "- Each claim MUST include 1 or 2 support_spans.\n"
+            "- Each support_span MUST be short (<= 120 chars), with no newlines.\n"
+            "- Keep draft under 200 characters.\n"
             "- Every claim MUST include evidence_ids (existing IDs) AND support_spans.\n"
             "- Each support_span MUST be an exact substring of the corresponding evidence text.\n"
             "- Copy/paste support_spans from the evidence verbatim (including punctuation/quotes).\n"
             "- Prefer short spans that are easy to match (numbers, IDs, exact JSON fragments).\n"
             "- Never include the leading [evidence_id] label in support_spans.\n"
+            "- Output key order MUST be: claims, draft, proactive.\n"
+            "- Claim key order MUST be: text, evidence_ids, support_spans, kind.\n"
             "- Do NOT introduce facts not supported by evidence.\n"
             "- If evidence is insufficient, return claims=[] and draft='I don't know'.\n\n"
+            "- Set proactive=[] unless the user explicitly asked for suggestions.\n\n"
             "Examples (illustrative only; do not copy placeholder IDs):\n"
-            "Evidence: [<EVID>]\\n{\"result\": 2.5, \"normalized_expression\": \"10/4\"}\n"
+            "Evidence: [<EVID>]\\n{\"normalized_expression\":\"10/4\",\"result\":2.5}\n"
             "Good claim: {\"text\":\"10/4 equals 2.5\",\"evidence_ids\":[\"<EVID>\"],\"support_spans\":[\"2.5\",\"10/4\"],\"kind\":\"math\"}\n"
             "Bad claim:  {\"text\":\"10/4 equals 2.5\",\"evidence_ids\":[\"<EVID>\"],\"support_spans\":[\"2.50\"],\"kind\":\"math\"}  (span not exact)\n\n"
+            "Evidence: [<EVID>]\\n{\"case_sensitive\":false,\"char\":\"r\",\"count\":2,\"text\":\"strawberry\"}\n"
+            "Good claim: {\"text\":\"The letter r appears 2 time(s) in the word strawberry.\",\"evidence_ids\":[\"<EVID>\"],\"support_spans\":[\"2\",\"strawberry\"],\"kind\":\"math\"}\n\n"
             "Output JSON format:\n"
             "{claims:[{text,evidence_ids,support_spans,kind}], draft:str, proactive:list}\n"
         )
