@@ -18,6 +18,7 @@ from .event_bus import EventBus
 from .initiative import InitiativeManager
 from .llm import ChatModel, LlamaCppChatModel, StubChatModel
 from .logging_utils import log, setup_logging
+from .model import DEFAULT_HF_MODEL, HFModelSpec, resolve_llama_model_path
 from .memory import MemoryStore
 from .planner import LLMPlanner, Planner, RulePlanner
 from .pyd_compat import _model_dump
@@ -26,6 +27,8 @@ from .renderer import Renderer
 from .tools import (
     CalcIn,
     CalcOut,
+    CountCharsIn,
+    CountCharsOut,
     MemSearchIn,
     MemSearchOut,
     NowIn,
@@ -39,6 +42,7 @@ from .tools import (
     WriteFileIn,
     WriteFileOut,
     calc_handler,
+    count_chars_handler,
     make_mem_search_handler,
     make_read_file_handler,
     make_write_file_handler,
@@ -58,6 +62,11 @@ class AgentConfig:
     st_model: str = "all-MiniLM-L6-v2"
     llm_backend: Literal["stub", "llama_cpp"] = "stub"
     llama_model: str = ""
+    llama_model_dir: str = "models"
+    llama_auto_download: bool = False
+    llama_hf_repo: str = DEFAULT_HF_MODEL.repo_id
+    llama_hf_file: str = DEFAULT_HF_MODEL.filename
+    llama_hf_rev: str = DEFAULT_HF_MODEL.revision
     llama_ctx: int = 4096
     llama_threads: Optional[int] = None
     llama_gpu_layers: int = 0
@@ -101,10 +110,15 @@ class CogOS:
 
         # LLM
         if cfg.llm_backend == "llama_cpp":
-            if not cfg.llama_model:
-                raise ValueError("--llama-model is required when --llm-backend llama_cpp")
-            self.llm: ChatModel = LlamaCppChatModel(
+            default_spec = HFModelSpec(repo_id=cfg.llama_hf_repo, filename=cfg.llama_hf_file, revision=cfg.llama_hf_rev)
+            model_path = resolve_llama_model_path(
                 cfg.llama_model,
+                auto_download=cfg.llama_auto_download,
+                model_dir=cfg.llama_model_dir,
+                default_spec=default_spec,
+            )
+            self.llm: ChatModel = LlamaCppChatModel(
+                model_path,
                 n_ctx=cfg.llama_ctx,
                 n_threads=cfg.llama_threads,
                 n_gpu_layers=cfg.llama_gpu_layers,
@@ -113,15 +127,21 @@ class CogOS:
             self.llm = StubChatModel()
 
         # planner
-        if cfg.planner == "llm" and cfg.llm_backend != "stub":
-            self.planner: Planner = LLMPlanner(self.llm, fallback=RulePlanner())
+        if cfg.planner == "llm":
+            if cfg.llm_backend == "stub":
+                raise ValueError("--planner llm requires --llm-backend != stub")
+            self.planner = LLMPlanner(self.llm)
         else:
             self.planner = RulePlanner()
 
         # reasoner
-        if cfg.reasoner == "llm" and cfg.llm_backend != "stub":
-            self.reasoner: Reasoner = LLMReasoner(self.llm)
-        elif cfg.reasoner == "search" and cfg.llm_backend != "stub":
+        if cfg.reasoner == "llm":
+            if cfg.llm_backend == "stub":
+                raise ValueError("--reasoner llm requires --llm-backend != stub")
+            self.reasoner = LLMReasoner(self.llm)
+        elif cfg.reasoner == "search":
+            if cfg.llm_backend == "stub":
+                raise ValueError("--reasoner search requires --llm-backend != stub")
             self.reasoner = SearchReasoner(LLMReasoner(self.llm), samples=cfg.search_samples)
         else:
             self.reasoner = ConservativeReasoner()
@@ -152,7 +172,13 @@ class CogOS:
             self.bg.start()
 
         log.info(
-            "CogOS started",
+            "CogOS started (db=%s, embedder=%s, llm=%s, planner=%s, reasoner=%s, fts=%s)",
+            cfg.db,
+            embedder.name,
+            cfg.llm_backend,
+            cfg.planner,
+            cfg.reasoner,
+            self.memory._fts_ok,
             extra={
                 "extra": {
                     "db": cfg.db,
@@ -174,6 +200,16 @@ class CogOS:
     def _register_tools(self) -> None:
         self.tools.register(
             ToolSpec("calc", "Safely evaluate arithmetic expressions.", CalcIn, CalcOut, calc_handler, side_effects=False)
+        )
+        self.tools.register(
+            ToolSpec(
+                "count_chars",
+                "Count occurrences of a character in a string.",
+                CountCharsIn,
+                CountCharsOut,
+                count_chars_handler,
+                side_effects=False,
+            )
         )
         self.tools.register(ToolSpec("now", "Get current local time.", NowIn, NowOut, now_handler, side_effects=False))
         self.tools.register(
@@ -285,4 +321,3 @@ class CogOS:
 
         proactive = self.initiative.poll(limit=3)
         return response, proactive
-

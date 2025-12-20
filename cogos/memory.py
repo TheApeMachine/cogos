@@ -6,8 +6,9 @@ import threading
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .embeddings import EmbeddingModel
+from .logging_utils import log
 from .np_compat import np
-from .util import jdump, jload, new_id, short, utc_ts
+from .util import jdump, jload, new_id, short, toks, utc_ts
 
 
 class MemoryStore:
@@ -143,7 +144,8 @@ class MemoryStore:
             c.execute("CREATE VIRTUAL TABLE IF NOT EXISTS evidence_fts USING fts5(id UNINDEXED, kind, content);")
             c.execute("CREATE VIRTUAL TABLE IF NOT EXISTS skills_fts USING fts5(id UNINDEXED, name, description);")
             return True
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as e:
+            log.warning("FTS5 unavailable; lexical search disabled: %s", e, exc_info=True)
             return False
 
     # ---- embeddings storage ----
@@ -579,9 +581,12 @@ class MemoryStore:
     def _fts_search(self, fts_table: str, query: str, k: int) -> List[str]:
         if not self._fts_ok:
             return []
-        q = query.strip()
-        if not q:
+        ts = toks(query)
+        if not ts:
             return []
+        # Construct a "safe" FTS query from tokens to avoid MATCH syntax errors
+        # (e.g. "User:" is parsed as a column selector).
+        q = " OR ".join(ts[:64])
         with self._lock:
             # bm25 smaller is better; we only use ranking order.
             rows = self._conn.execute(
@@ -713,4 +718,3 @@ class MemoryStore:
                 }
             )
         return out
-

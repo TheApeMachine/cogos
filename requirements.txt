@@ -1,0 +1,4 @@
+pydantic
+numpy
+# Optional local LLM backend:
+#   pip install -r requirements-llama.txt

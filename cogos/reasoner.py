@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from .ir import Claim, Plan, ProposedAnswer
 from .llm import ChatMessage, ChatModel
@@ -48,6 +48,24 @@ class ConservativeReasoner(Reasoner):
                     )
                 )
 
+        # string counts
+        for out in tool_outcomes:
+            if not (out.ok and out.evidence_id and out.tool == "count_chars"):
+                continue
+            text = str(out.output.get("text", "")).strip()
+            char = str(out.output.get("char", "")).strip()
+            count = out.output.get("count")
+            if not text or not char or count is None:
+                continue
+            claims.append(
+                Claim(
+                    text=f"The letter {char} appears {count} time(s) in the word {text}.",
+                    evidence_ids=[out.evidence_id],
+                    support_spans=[str(count), char, text],
+                    kind="math",
+                )
+            )
+
         # surface top memory hits as "related items" (not asserting facts)
         mem_evid = next((o for o in tool_outcomes if o.ok and o.tool == "memory_search" and o.evidence_id), None)
         if mem_evid and mem_evid.evidence_id:
@@ -69,8 +87,14 @@ class LLMReasoner(Reasoner):
     def __init__(self, model: ChatModel):
         self.model = model
 
+    class _RawClaim(BaseModel):
+        text: str
+        evidence_ids: List[str]
+        support_spans: List[str]
+        kind: Literal["fact", "math", "inference"] = "fact"
+
     class _Schema(BaseModel):
-        claims: List[Dict[str, Any]] = Field(default_factory=list)
+        claims: List["LLMReasoner._RawClaim"] = Field(default_factory=list)
         draft: str = ""
         proactive: List[Dict[str, Any]] = Field(default_factory=list)
 
@@ -120,15 +144,11 @@ class LLMReasoner(Reasoner):
 
         claims: List[Claim] = []
         for rc in raw.claims:
-            try:
-                text = str(rc.get("text", "")).strip()
-                eids = list(rc.get("evidence_ids") or [])
-                spans = [str(s) for s in (rc.get("support_spans") or []) if str(s).strip()]
-                kind = rc.get("kind") or "fact"
-                if text and eids and spans:
-                    claims.append(Claim(text=text, evidence_ids=eids, support_spans=spans, kind=kind))
-            except Exception:
-                continue
+            text = str(rc.text or "").strip()
+            eids = list(rc.evidence_ids or [])
+            spans = [str(s) for s in (rc.support_spans or []) if str(s).strip()]
+            if text and eids and spans:
+                claims.append(Claim(text=text, evidence_ids=eids, support_spans=spans, kind=rc.kind))
 
         return ProposedAnswer(claims=claims, draft=str(raw.draft or ""), proactive=list(raw.proactive or []))
 
@@ -144,7 +164,10 @@ class SearchReasoner(Reasoner):
 
     def __init__(self, base: LLMReasoner, samples: int = 4):
         self.base = base
-        self.samples = int(samples)
+        n = int(samples)
+        if n < 1:
+            raise ValueError("samples must be >= 1")
+        self.samples = n
 
     @staticmethod
     def _looks_supported(claim: Claim, evidence_map: Dict[str, str]) -> float:
@@ -188,16 +211,13 @@ class SearchReasoner(Reasoner):
         best_score = -1.0
 
         for _ in range(self.samples):
-            try:
-                cand = self.base.propose(
-                    user_text,
-                    plan=plan,
-                    evidence_map=evidence_map,
-                    memory_hits=memory_hits,
-                    tool_outcomes=tool_outcomes,
-                )
-            except Exception:
-                continue
+            cand = self.base.propose(
+                user_text,
+                plan=plan,
+                evidence_map=evidence_map,
+                memory_hits=memory_hits,
+                tool_outcomes=tool_outcomes,
+            )
 
             # Score candidate by how supported its claims look.
             if not cand.claims:
@@ -214,4 +234,3 @@ class SearchReasoner(Reasoner):
                 best = cand
 
         return best or ProposedAnswer(claims=[], draft="I don't know.", proactive=[])
-

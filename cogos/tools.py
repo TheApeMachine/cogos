@@ -208,6 +208,34 @@ def make_mem_search_handler(mem: MemoryStore) -> Callable[[MemSearchIn], MemSear
     return _h
 
 
+class CountCharsIn(BaseModel):
+    text: str
+    char: str
+    case_sensitive: bool = True
+
+
+class CountCharsOut(BaseModel):
+    text: str
+    char: str
+    count: int
+    case_sensitive: bool
+
+
+def count_chars_handler(inp: CountCharsIn) -> CountCharsOut:
+    text = inp.text or ""
+    char = (inp.char or "")
+    if len(char) != 1:
+        raise ValueError("char must be a single character.")
+
+    haystack = text
+    needle = char
+    if not inp.case_sensitive:
+        haystack = haystack.lower()
+        needle = needle.lower()
+
+    return CountCharsOut(text=text, char=char, count=int(haystack.count(needle)), case_sensitive=bool(inp.case_sensitive))
+
+
 def _resolve_under_roots(path: str, roots: Sequence[str]) -> Path:
     p = Path(path).expanduser().resolve()
     for r in roots:
@@ -270,4 +298,3 @@ def make_write_file_handler(roots: Sequence[str]) -> Callable[[WriteFileIn], Wri
         return WriteFileOut(path=str(p), bytes_written=len(data))
 
     return _h
-

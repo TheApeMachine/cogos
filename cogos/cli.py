@@ -5,9 +5,11 @@ import datetime as dt
 import os
 import signal
 import threading
+from pathlib import Path
 from typing import List, Optional
 
 from .agent import AgentConfig, CogOS
+from .model import HFModelSpec, ensure_hf_model
 from .tools import ToolCall
 from .util import short
 
@@ -28,6 +30,11 @@ def cmd_chat(args: argparse.Namespace) -> int:
         st_model=args.st_model,
         llm_backend=args.llm_backend,
         llama_model=args.llama_model,
+        llama_model_dir=args.llama_model_dir,
+        llama_auto_download=args.llama_auto_download,
+        llama_hf_repo=args.llama_hf_repo,
+        llama_hf_file=args.llama_hf_file,
+        llama_hf_rev=args.llama_hf_rev,
         llama_ctx=args.llama_ctx,
         llama_threads=args.llama_threads,
         llama_gpu_layers=args.llama_gpu_layers,
@@ -53,7 +60,10 @@ def cmd_chat(args: argparse.Namespace) -> int:
     _install_sigint_handler(stop_flag)
 
     try:
-        print("CogOS production baseline. /help for commands. Ctrl-C or /quit to exit.\n")
+        print(
+            f"CogOS production baseline (llm={agent.cfg.llm_backend}, planner={agent.cfg.planner}, reasoner={agent.cfg.reasoner}). "
+            "/help for commands. Ctrl-C or /quit to exit.\n"
+        )
         while not stop_flag.is_set():
             try:
                 user = input("you> ").strip()
@@ -216,6 +226,13 @@ def cmd_selftest(args: argparse.Namespace) -> int:
                 pass
 
 
+def cmd_download_model(args: argparse.Namespace) -> int:
+    spec = HFModelSpec(repo_id=args.hf_repo, filename=args.hf_file, revision=args.hf_rev)
+    path = ensure_hf_model(spec, model_dir=Path(args.model_dir).expanduser().resolve())
+    print(str(path))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="cogos_prod", description="CogOS production-grade baseline (split into modules).")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -228,7 +245,16 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--st-model", default="all-MiniLM-L6-v2")
 
     chat.add_argument("--llm-backend", choices=["stub", "llama_cpp"], default="stub")
-    chat.add_argument("--llama-model", default=os.environ.get("COGOS_LLAMA_MODEL", ""))
+    chat.add_argument(
+        "--llama-model",
+        default=os.environ.get("COGOS_LLAMA_MODEL", ""),
+        help="Local `.gguf` path or `hf://org/repo/path/to/file.gguf[@rev]`",
+    )
+    chat.add_argument("--llama-model-dir", default=os.environ.get("COGOS_LLAMA_MODEL_DIR", "models"))
+    chat.add_argument("--llama-auto-download", action="store_true", help="Download default model if --llama-model is empty.")
+    chat.add_argument("--llama-hf-repo", default=os.environ.get("COGOS_LLAMA_HF_REPO", "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF"))
+    chat.add_argument("--llama-hf-file", default=os.environ.get("COGOS_LLAMA_HF_FILE", "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"))
+    chat.add_argument("--llama-hf-rev", default=os.environ.get("COGOS_LLAMA_HF_REV", "main"))
     chat.add_argument("--llama-ctx", type=int, default=int(os.environ.get("COGOS_LLAMA_CTX", "4096")))
     chat.add_argument("--llama-threads", type=int, default=None)
     chat.add_argument("--llama-gpu-layers", type=int, default=int(os.environ.get("COGOS_LLAMA_GPU_LAYERS", "0")))
@@ -262,10 +288,16 @@ def build_parser() -> argparse.ArgumentParser:
     selftest = sub.add_parser("selftest", help="Run quick internal sanity tests.")
     selftest.add_argument("--db", default="")
     selftest.set_defaults(func=cmd_selftest)
+
+    dl = sub.add_parser("download-model", help="Download a default GGUF model from Hugging Face.")
+    dl.add_argument("--model-dir", default=os.environ.get("COGOS_LLAMA_MODEL_DIR", "models"))
+    dl.add_argument("--hf-repo", default=os.environ.get("COGOS_LLAMA_HF_REPO", "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF"))
+    dl.add_argument("--hf-file", default=os.environ.get("COGOS_LLAMA_HF_FILE", "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"))
+    dl.add_argument("--hf-rev", default=os.environ.get("COGOS_LLAMA_HF_REV", "main"))
+    dl.set_defaults(func=cmd_download_model)
     return p
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     return args.func(args)
-

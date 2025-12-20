@@ -716,9 +716,12 @@ class MemoryStore:
     def _fts_search(self, fts_table: str, query: str, k: int) -> List[str]:
         if not self._fts_ok:
             return []
-        q = query.strip()
-        if not q:
+        ts = toks(query)
+        if not ts:
             return []
+        # Construct a "safe" FTS query from tokens to avoid MATCH syntax errors
+        # (e.g. "User:" is parsed as a column selector).
+        q = " OR ".join(ts[:64])
         with self._lock:
             # bm25 smaller is better; we only use ranking order.
             rows = self._conn.execute(

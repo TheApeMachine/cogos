@@ -292,7 +292,13 @@ class BackgroundRunner:
                     try:
                         d.on_event(evt, self.ctx)
                     except Exception as e:
-                        log.warning("daemon.on_event failed", extra={"extra": {"daemon": d.name, "err": str(e)}})
+                        log.warning(
+                            "daemon.on_event failed (daemon=%s): %s",
+                            d.name,
+                            e,
+                            exc_info=True,
+                            extra={"extra": {"daemon": d.name, "err": str(e)}},
+                        )
             now = utc_ts()
             for d in self.daemons:
                 if now - self._last_tick.get(d.name, 0.0) >= d.tick_every_s:
@@ -300,5 +306,10 @@ class BackgroundRunner:
                     try:
                         d.tick(self.ctx)
                     except Exception as e:
-                        log.warning("daemon.tick failed", extra={"extra": {"daemon": d.name, "err": str(e)}})
-
+                        log.warning(
+                            "daemon.tick failed (daemon=%s): %s",
+                            d.name,
+                            e,
+                            exc_info=True,
+                            extra={"extra": {"daemon": d.name, "err": str(e)}},
+                        )
