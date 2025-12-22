@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
-from typing import Any, Callable, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence
 
 from .pyd_compat import BaseModel, _model_json_schema
 from .util import extract_first_json_object, short
@@ -52,6 +52,64 @@ int ::= "-"? ("0" | [1-9] [0-9]* ) ws
 
 ws ::= [ \t\n\r]*
 """
+
+_PLAN_GBNF_DYNAMIC_TOOLS = r"""
+root ::= plan
+
+plan ::= "{" ws "\"steps\"" ws ":" ws steps ws "}" ws
+steps ::= "[" ws (headsteps ws "," ws)? respondstep ws "]" ws
+
+headsteps ::= headstep (ws "," ws headstep)*
+headstep ::= memorysearchstep | toolcallstep | writenotestep | createtaskstep
+
+respondstep ::= "{" ws "\"type\"" ws ":" ws "\"respond\"" ws "," ws "\"style\"" ws ":" ws string "}" ws
+
+memorysearchstep ::= "{" ws "\"type\"" ws ":" ws "\"memory_search\"" ws "," ws "\"query\"" ws ":" ws string ws "," ws "\"k\"" ws ":" ws int "}" ws
+toolcallstep ::= "{" ws "\"type\"" ws ":" ws "\"tool_call\"" ws "," ws "\"tool\"" ws ":" ws toolname ws "," ws "\"arguments\"" ws ":" ws object "}" ws
+writenotestep ::= "{" ws "\"type\"" ws ":" ws "\"write_note\"" ws "," ws "\"title\"" ws ":" ws string ws "," ws "\"content\"" ws ":" ws string ws "," ws "\"tags\"" ws ":" ws stringarray ws "," ws "\"confidence\"" ws ":" ws number "}" ws
+createtaskstep ::= "{" ws "\"type\"" ws ":" ws "\"create_task\"" ws "," ws "\"title\"" ws ":" ws string ws "," ws "\"description\"" ws ":" ws string ws "," ws "\"priority\"" ws ":" ws int ws "," ws "\"payload\"" ws ":" ws object "}" ws
+
+__TOOLNAME_RULE__
+
+value ::= object | array | string | number | ("true" | "false" | "null") ws
+
+object ::= "{" ws ( member (ws "," ws member)* )? "}" ws
+member ::= string ":" ws value
+
+array ::= "[" ws ( value (ws "," ws value)* )? "]" ws
+stringarray ::= "[" ws ( string (ws "," ws string)* )? "]" ws
+
+string ::= "\"" ( [^"\\] | "\\" ( ["\\/bfnrt] | "u" [0-9a-fA-F]{4} ) )* "\"" ws
+number ::= "-"? ("0" | [1-9] [0-9]* ) ( "." [0-9]+ )? ( [eE] [+-]? [0-9]+ )? ws
+int ::= "-"? ("0" | [1-9] [0-9]* ) ws
+
+ws ::= [ \t\n\r]*
+"""
+
+
+def _gbnf_literal_for_json_string(s: str) -> str:
+    """
+    Return a GBNF literal that matches the exact JSON string encoding of `s`.
+
+    Example: s="calc" -> "\"calc\""
+    """
+    js = json.dumps(str(s), ensure_ascii=False)
+    escaped = js.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def build_plan_gbnf(tool_names: Sequence[str]) -> str:
+    """
+    Build a plan grammar that constrains tool names to the provided set.
+    Falls back to the static grammar if tool_names is empty.
+    """
+    names = sorted({str(n).strip() for n in tool_names if str(n).strip()})
+    if not names:
+        return _PLAN_GBNF
+    alts = " | ".join(_gbnf_literal_for_json_string(n) for n in names)
+    tool_rule = f"toolname ::= ( {alts} ) ws"
+    return _PLAN_GBNF_DYNAMIC_TOOLS.replace("__TOOLNAME_RULE__", tool_rule)
+
 
 _REASONER_GBNF = r"""
 root ::= answer
@@ -131,6 +189,16 @@ class LlamaCppChatModel(ChatModel):
             n_gpu_layers=int(n_gpu_layers),
         )
         self._grammar_cls = LlamaGrammar
+        self._plan_tool_names: Optional[List[str]] = None
+
+    def set_plan_tool_names(self, tool_names: Sequence[str]) -> None:
+        """
+        Configure the set of tool names that the Plan grammar will allow.
+
+        If unset/empty, the planner grammar allows any string tool name.
+        """
+        names = sorted({str(n).strip() for n in tool_names if str(n).strip()})
+        self._plan_tool_names = names if names else None
 
     @staticmethod
     def _to_chat_messages(messages: List[ChatMessage]) -> List[Dict[str, str]]:
@@ -186,7 +254,8 @@ class LlamaCppChatModel(ChatModel):
         if self._grammar_cls is None:
             return None
         if schema.__module__ == "cogos.ir" and schema.__name__ == "Plan" and hasattr(self._grammar_cls, "from_string"):
-            return self._grammar_cls.from_string(_PLAN_GBNF)  # type: ignore[no-any-return]
+            gbnf = build_plan_gbnf(self._plan_tool_names or [])
+            return self._grammar_cls.from_string(gbnf)  # type: ignore[no-any-return]
         if (
             schema.__module__ == "cogos.reasoner"
             and schema.__qualname__.endswith("LLMReasoner._Schema")

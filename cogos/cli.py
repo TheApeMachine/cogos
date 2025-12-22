@@ -24,6 +24,11 @@ def _install_sigint_handler(stop_flag: threading.Event) -> None:
 
 
 def cmd_chat(args: argparse.Namespace) -> int:
+    if args.web_allow_domain is None:
+        web_allow_domain = ["wikipedia.org", "arxiv.org", "github.com"]
+    else:
+        web_allow_domain = args.web_allow_domain
+
     cfg = AgentConfig(
         db=args.db,
         session_id=args.session_id,
@@ -43,6 +48,13 @@ def cmd_chat(args: argparse.Namespace) -> int:
         reasoner=args.reasoner,
         search_samples=args.search_samples,
         allow_side_effects=args.allow_side_effects,
+        allow_web_search=args.allow_web_search,
+        auto_research=args.auto_research,
+        web_allow_domains=tuple(web_allow_domain),
+        web_deny_domains=tuple(args.web_deny_domain or []),
+        min_evidence_trust=args.min_evidence_trust,
+        notary=args.notary,
+        notary_priority=args.notary_priority,
         read_root=tuple(args.read_root),
         write_root=tuple(args.write_root),
         prune_episodes=args.prune_episodes,
@@ -271,6 +283,45 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--search-samples", type=int, default=4)
 
     chat.add_argument("--allow-side-effects", action="store_true")
+    chat.add_argument(
+        "--allow-web-search",
+        action="store_true",
+        help="Enable the web_search tool (network). If disabled, CogOS is fully offline/local-first.",
+    )
+    chat.add_argument(
+        "--auto-research",
+        action="store_true",
+        help="If memory_search yields no hits, automatically run web_search once to gather evidence (context firewall).",
+    )
+    chat.add_argument(
+        "--web-allow-domain",
+        action="append",
+        default=None,
+        help="Allowlist domains for web_search (repeatable).",
+    )
+    chat.add_argument(
+        "--web-deny-domain",
+        action="append",
+        default=[],
+        help="Denylist domains for web_search (repeatable).",
+    )
+    chat.add_argument(
+        "--min-evidence-trust",
+        type=float,
+        default=0.0,
+        help="Verifier threshold: reject claims that cite evidence with trust_score below this value (0.0-1.0).",
+    )
+    chat.add_argument(
+        "--notary",
+        action="store_true",
+        help="Enable the Notary: if auto-research steering fails to produce verified claims, escalate for human review.",
+    )
+    chat.add_argument(
+        "--notary-priority",
+        type=int,
+        default=10,
+        help="Priority used for Notary-created human review tasks.",
+    )
     chat.add_argument("--read-root", action="append", default=["."])
     chat.add_argument("--write-root", action="append", default=["."])
 

@@ -26,8 +26,10 @@ class MemoryStore:
         self.db_path = db_path
         self.embedder = embedder
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        # `timeout` is sqlite3's busy timeout (seconds); also set PRAGMA busy_timeout (ms) for clarity.
+        self._conn = sqlite3.connect(db_path, check_same_thread=False, timeout=5.0)
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA busy_timeout=5000;")
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA synchronous=NORMAL;")
         self._conn.execute("PRAGMA foreign_keys=ON;")
@@ -112,6 +114,7 @@ class MemoryStore:
                     priority INTEGER NOT NULL,
                     title TEXT NOT NULL,
                     description TEXT NOT NULL,
+                    parent_id TEXT,                   -- parent task id (for subtasks / dependencies)
                     payload TEXT,
                     result TEXT,
                     evidence_ids TEXT,
@@ -121,6 +124,7 @@ class MemoryStore:
                 );
             """
             )
+            self._ensure_task_schema(c)
             c.execute(
                 """
                 CREATE TABLE IF NOT EXISTS proactive(
@@ -137,6 +141,28 @@ class MemoryStore:
             # FTS5 (lexical)
             self._fts_ok = self._try_init_fts(c)
             self._conn.commit()
+
+    def _ensure_task_schema(self, c: sqlite3.Cursor) -> None:
+        """
+        Best-effort task table migrations for existing DBs.
+
+        Keeps the runtime robust even when the schema evolves across versions.
+        """
+        try:
+            cols = {str(r["name"]) for r in c.execute("PRAGMA table_info(tasks)").fetchall()}
+        except Exception:
+            cols = set()
+        if "parent_id" not in cols:
+            try:
+                c.execute("ALTER TABLE tasks ADD COLUMN parent_id TEXT;")
+            except Exception:
+                # If the column exists already or ALTER TABLE isn't possible, ignore.
+                pass
+        # Helpful for dependency checks
+        try:
+            c.execute("CREATE INDEX IF NOT EXISTS idx_tasks_parent_id ON tasks(parent_id);")
+        except Exception:
+            pass
 
     def _try_init_fts(self, c: sqlite3.Cursor) -> bool:
         try:
@@ -463,15 +489,36 @@ class MemoryStore:
         *,
         priority: int = 0,
         payload: Optional[Dict[str, Any]] = None,
+        parent_id: Optional[str] = None,
         next_run_ts: Optional[float] = None,
     ) -> str:
         tid = new_id("task")
         now = utc_ts()
+        # Allow parent linkage to be passed via payload for convenience/back-compat.
+        if parent_id is None and payload:
+            pid = payload.get("parent_id") or payload.get("parent_task_id") or payload.get("parent")
+            if isinstance(pid, str) and pid.strip():
+                parent_id = pid.strip()
         with self._lock:
             self._conn.execute(
-                "INSERT INTO tasks(id, created, updated, status, priority, title, description, payload, result, evidence_ids, error, attempts, next_run_ts) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (tid, now, now, "queued", int(priority), title, description, jdump(payload or {}), jdump({}), jdump([]), "", 0, next_run_ts),
+                "INSERT INTO tasks(id, created, updated, status, priority, title, description, parent_id, payload, result, evidence_ids, error, attempts, next_run_ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    tid,
+                    now,
+                    now,
+                    "queued",
+                    int(priority),
+                    title,
+                    description,
+                    parent_id,
+                    jdump(payload or {}),
+                    jdump({}),
+                    jdump([]),
+                    "",
+                    0,
+                    next_run_ts,
+                ),
             )
             self._conn.commit()
         return tid
@@ -501,9 +548,15 @@ class MemoryStore:
     def fetch_runnable_task(self, now_ts: Optional[float] = None) -> Optional[Dict[str, Any]]:
         now_ts = utc_ts() if now_ts is None else now_ts
         with self._lock:
+            # Avoid running a parent task before its children reach a terminal status.
             row = self._conn.execute(
-                "SELECT * FROM tasks WHERE status IN ('queued','blocked') AND (next_run_ts IS NULL OR next_run_ts <= ?) "
-                "ORDER BY priority DESC, updated ASC LIMIT 1",
+                "SELECT * FROM tasks t "
+                "WHERE t.status IN ('queued','blocked') "
+                "AND (t.next_run_ts IS NULL OR t.next_run_ts <= ?) "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM tasks c WHERE c.parent_id = t.id AND c.status NOT IN ('done','failed')"
+                ") "
+                "ORDER BY t.priority DESC, t.updated ASC LIMIT 1",
                 (now_ts,),
             ).fetchone()
             if not row:
@@ -525,10 +578,34 @@ class MemoryStore:
     ) -> None:
         now = utc_ts()
         with self._lock:
+            # Capture parent linkage (if any) so we can wake parents when children finish.
+            parent_id = None
+            try:
+                prow = self._conn.execute("SELECT parent_id FROM tasks WHERE id=?", (tid,)).fetchone()
+                if prow and prow["parent_id"]:
+                    parent_id = str(prow["parent_id"])
+            except Exception:
+                parent_id = None
             self._conn.execute(
                 "UPDATE tasks SET updated=?, status=?, result=?, evidence_ids=?, error=?, attempts=attempts+1, next_run_ts=? WHERE id=?",
                 (now, status, jdump(result or {}), jdump(evidence_ids or []), error, next_run_ts, tid),
             )
+            # If this is a child task and it reached a terminal state, allow its parent to run sooner.
+            if parent_id and status in ("done", "failed"):
+                try:
+                    row = self._conn.execute(
+                        "SELECT COUNT(1) AS n FROM tasks WHERE parent_id=? AND status NOT IN ('done','failed')",
+                        (parent_id,),
+                    ).fetchone()
+                    remaining = int(row["n"]) if row else 0
+                    if remaining == 0:
+                        self._conn.execute(
+                            "UPDATE tasks SET updated=?, status=CASE WHEN status='blocked' THEN 'queued' ELSE status END, next_run_ts=NULL "
+                            "WHERE id=? AND status NOT IN ('done','failed')",
+                            (now, parent_id),
+                        )
+                except Exception:
+                    pass
             self._conn.commit()
 
     # ---- proactive ----
@@ -659,14 +736,26 @@ class MemoryStore:
             n = self.get_note(doc_id)
             if not n:
                 continue
+            tags = list(n.get("tags") or [])
+            source_ids = list(n.get("source_ids") or [])
+            conf = float(n.get("confidence", 0.5))
+            # Heuristic trust: user-sourced notes are easier to poison; treat as lower trust by default.
+            trust = 0.25 + 0.5 * conf
+            if any(str(s).startswith("ep_") for s in source_ids):
+                trust = min(trust, 0.35)
+            if ("conversation" in tags) or ("episode_digest" in tags):
+                trust = min(trust, 0.45)
+            trust = max(0.0, min(1.0, trust))
             out.append(
                 {
                     "id": n["id"],
                     "title": n["title"],
                     "content_snip": short(n["content"], 800),
-                    "tags": n["tags"],
+                    "tags": tags,
                     "links": n["links"],
-                    "confidence": n["confidence"],
+                    "source_ids": source_ids,
+                    "confidence": conf,
+                    "trust_score": float(trust),
                     "score": float(score),
                 }
             )
@@ -686,11 +775,18 @@ class MemoryStore:
             ev = self.get_evidence(doc_id)
             if not ev:
                 continue
+            md = ev.get("metadata") or {}
+            try:
+                trust = float(md.get("trust_score", 1.0))
+            except Exception:
+                trust = 1.0
             out.append(
                 {
                     "id": ev["id"],
                     "kind": ev["kind"],
                     "content_snip": short(ev["content"], 800),
+                    "source_type": str(md.get("source_type", "")),
+                    "trust_score": float(trust),
                     "score": float(score),
                 }
             )

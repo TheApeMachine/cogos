@@ -16,14 +16,28 @@ class Verifier:
     - If claim text contains numbers, those numbers must appear in evidence.
     """
 
-    def __init__(self, memory: MemoryStore, *, require_spans: bool = True, min_span_hits: float = 0.5):
+    def __init__(
+        self,
+        memory: MemoryStore,
+        *,
+        require_spans: bool = True,
+        min_span_hits: float = 0.5,
+        min_trust_score: float = 0.0,
+    ):
         self.memory = memory
         self.require_spans = require_spans
         self.min_span_hits = float(min_span_hits)
+        self.min_trust_score = float(min_trust_score)
 
     def _ev_text(self, evid: str) -> Optional[str]:
         ev = self.memory.get_evidence(evid)
         if not ev:
+            return None
+        try:
+            trust = float((ev.get("metadata") or {}).get("trust_score", 1.0))
+        except Exception:
+            trust = 1.0
+        if trust < self.min_trust_score:
             return None
         return ev["content"] or ""
 

@@ -20,6 +20,7 @@ from .llm import ChatModel, LlamaCppChatModel, StubChatModel
 from .logging_utils import log, setup_logging
 from .model import DEFAULT_HF_MODEL, HFModelSpec, resolve_llama_model_path
 from .memory import MemoryStore
+from .notary import Notary
 from .planner import LLMPlanner, Planner, RulePlanner
 from .pyd_compat import _model_dump
 from .reasoner import ConservativeReasoner, LLMReasoner, Reasoner, SearchReasoner
@@ -39,12 +40,15 @@ from .tools import (
     ToolCall,
     ToolOutcome,
     ToolSpec,
+    WebSearchIn,
+    WebSearchOut,
     WriteFileIn,
     WriteFileOut,
     calc_handler,
     count_chars_handler,
     make_mem_search_handler,
     make_read_file_handler,
+    make_web_search_handler,
     make_write_file_handler,
     now_handler,
 )
@@ -74,6 +78,13 @@ class AgentConfig:
     reasoner: Literal["conservative", "llm", "search"] = "conservative"
     search_samples: int = 4
     allow_side_effects: bool = False
+    allow_web_search: bool = False
+    auto_research: bool = False
+    web_allow_domains: Tuple[str, ...] = ("wikipedia.org", "arxiv.org", "github.com")
+    web_deny_domains: Tuple[str, ...] = ()
+    min_evidence_trust: float = 0.0
+    notary: bool = False
+    notary_priority: int = 10
     read_root: Tuple[str, ...] = (".",)
     write_root: Tuple[str, ...] = (".",)
     prune_episodes: bool = False
@@ -105,8 +116,9 @@ class CogOS:
         self._register_tools()
 
         self.initiative = InitiativeManager(self.memory, threshold=cfg.initiative_threshold)
-        self.verifier = Verifier(self.memory, require_spans=True, min_span_hits=0.5)
+        self.verifier = Verifier(self.memory, require_spans=True, min_span_hits=0.5, min_trust_score=cfg.min_evidence_trust)
         self.renderer = Renderer(self.memory)
+        self.notary = Notary(self.memory, priority=cfg.notary_priority) if cfg.notary else None
 
         # LLM
         if cfg.llm_backend == "llama_cpp":
@@ -125,6 +137,19 @@ class CogOS:
             )
         else:
             self.llm = StubChatModel()
+
+        # Configure planner grammar constraints (when supported): only allow tools that are actually runnable.
+        if isinstance(self.llm, LlamaCppChatModel) and hasattr(self.llm, "set_plan_tool_names"):
+            try:
+                allowed_tool_names = [
+                    t["name"]
+                    for t in self.tools.list_tools()
+                    if (self.tools.allow_side_effects or (not bool(t.get("side_effects"))))
+                ]
+                self.llm.set_plan_tool_names(allowed_tool_names)
+            except Exception:
+                # Grammar configuration is a best-effort enhancement; never block startup.
+                pass
 
         # planner
         if cfg.planner == "llm":
@@ -220,6 +245,26 @@ class CogOS:
                 MemSearchOut,
                 make_mem_search_handler(self.memory),
                 side_effects=False,
+                source_type="memory_search",
+                default_trust_score=0.5,
+                evidence_metadata_builder=lambda _inp, out: {
+                    "result_count": len(getattr(out, "notes", []) or [])
+                    + len(getattr(out, "evidence", []) or [])
+                    + len(getattr(out, "skills", []) or []),
+                    "trust_score": max(
+                        [
+                            float((n or {}).get("trust_score", 0.0))
+                            for n in (getattr(out, "notes", []) or [])
+                            if isinstance(n, dict)
+                        ]
+                        + [
+                            float((e or {}).get("trust_score", 0.0))
+                            for e in (getattr(out, "evidence", []) or [])
+                            if isinstance(e, dict)
+                        ]
+                        or [0.0]
+                    ),
+                },
             )
         )
         self.tools.register(
@@ -242,6 +287,28 @@ class CogOS:
                 side_effects=True,
             )
         )
+        if self.cfg.allow_web_search:
+            self.tools.register(
+                ToolSpec(
+                    "web_search",
+                    "Search the web (best-effort, allowlist filtered).",
+                    WebSearchIn,
+                    WebSearchOut,
+                    make_web_search_handler(
+                        allow_domains=self.cfg.web_allow_domains,
+                        deny_domains=self.cfg.web_deny_domains,
+                    ),
+                    side_effects=False,
+                    source_type="web_search",
+                    default_trust_score=0.35,
+                    evidence_metadata_builder=lambda _inp, out: {
+                        "provider": getattr(out, "provider", "unknown"),
+                        "result_count": len(getattr(out, "results", []) or []),
+                        "source_urls": [r.url for r in (getattr(out, "results", []) or [])[:5] if getattr(r, "url", "")],
+                        "trust_score": max([float(getattr(r, "trust_score", 0.0)) for r in (getattr(out, "results", []) or [])] or [0.0]),
+                    },
+                )
+            )
 
     def handle(self, user_text: str) -> tuple[str, List[Dict[str, Any]]]:
         # episodic log: user
@@ -293,6 +360,17 @@ class CogOS:
             elif isinstance(step, StepRespond):
                 pass
 
+        # Optional self-hydration: if memory search found nothing and web_search is enabled, try gathering evidence.
+        if self.cfg.auto_research and self.cfg.allow_web_search:
+            had_mem_search = any(o.ok and o.tool == "memory_search" for o in tool_outcomes)
+            had_web_search = any(o.ok and o.tool == "web_search" for o in tool_outcomes)
+            empty_hits = not (memory_hits.get("notes") or memory_hits.get("evidence") or memory_hits.get("skills"))
+            if had_mem_search and empty_hits and (not had_web_search):
+                out = self.tools.execute(ToolCall(name="web_search", arguments={"query": user_text, "k": 5}))
+                tool_outcomes.append(out)
+                if out.evidence_id:
+                    evidence_ids.append(out.evidence_id)
+
         # Evidence map for reasoner
         evidence_map: Dict[str, str] = {}
         for eid in evidence_ids:
@@ -309,6 +387,26 @@ class CogOS:
         )
         verified = self.verifier.verify(proposed)
         response = self.renderer.render(verified)
+
+        # Notary: if we attempted steering via auto-research and still can't verify, cut the hard-line and escalate.
+        if (
+            self.notary is not None
+            and (not verified.ok)
+            and self.cfg.auto_research
+            and self.cfg.allow_web_search
+            and any(o.tool == "web_search" for o in tool_outcomes)
+        ):
+            self.notary.escalate(
+                user_text=user_text,
+                plan=plan,
+                verified=verified,
+                tool_outcomes=tool_outcomes,
+                reason="abstained after web_search steering",
+            )
+            response = (
+                "I can’t verify any claims from trusted evidence. "
+                "I’ve flagged this for human review and will not proceed further on this thread."
+            )
 
         # episodic log: assistant
         ep_bot = self.memory.add_episode(
