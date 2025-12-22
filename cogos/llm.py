@@ -121,11 +121,11 @@ claims ::= "[" ws "]" ws
        | "[" ws claim ws "," ws claim ws "]" ws
        | "[" ws claim ws "," ws claim ws "," ws claim ws "]" ws
 
-claim ::= "{" ws "\"text\"" ws ":" ws string ws "," ws "\"evidence_ids\"" ws ":" ws evidlist ws "," ws "\"support_spans\"" ws ":" ws spanlist ws "," ws "\"kind\"" ws ":" ws kind "}" ws
+claim ::= "{" ws "\"text\"" ws ":" ws string ws "," ws "\"evidence_ids\"" ws ":" ws evidlist ws "," ws "\"support_span_ids\"" ws ":" ws spanidlist ws "," ws "\"kind\"" ws ":" ws kind "}" ws
 
 evidlist ::= "[" ws string ws "]" ws
-spanlist ::= "[" ws string ws "]" ws
-         | "[" ws string ws "," ws string ws "]" ws
+spanidlist ::= "[" ws int ws "]" ws
+           | "[" ws int ws "," ws int ws "]" ws
 
 kind ::= "\"fact\"" ws | "\"math\"" ws | "\"inference\"" ws
 
@@ -142,6 +142,7 @@ stringarray ::= "[" ws ( string (ws "," ws string)* )? "]" ws
 
 string ::= "\"" ( [^"\\] | "\\" ( ["\\/bfnrt] | "u" [0-9a-fA-F]{4} ) )* "\"" ws
 number ::= "-"? ("0" | [1-9] [0-9]* ) ( "." [0-9]+ )? ( [eE] [+-]? [0-9]+ )? ws
+int ::= "-"? ("0" | [1-9] [0-9]* ) ws
 
 ws ::= [ \t\n\r]*
 """

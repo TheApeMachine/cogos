@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Dict, List, Literal, Optional
 
@@ -87,10 +88,100 @@ class LLMReasoner(Reasoner):
     def __init__(self, model: ChatModel):
         self.model = model
 
+    @staticmethod
+    def _build_span_menu(evidence_text: str, user_text: str, *, max_spans: int = 14) -> List[str]:
+        """
+        Build a small menu of candidate support spans extracted from `evidence_text`.
+
+        The model will cite spans by index, and we will map indices back to the exact
+        substring. This avoids brittle "copy/paste exact substring" behavior.
+        """
+        txt = str(evidence_text or "")
+        if not txt:
+            return []
+
+        MAX_LEN = 120
+        max_spans = max(1, int(max_spans))
+        user_tokens = set(toks(user_text or ""))
+
+        def score(seg: str) -> float:
+            st = set(toks(seg))
+            if not st:
+                return 0.0
+            if not user_tokens:
+                return 0.0
+            return len(st & user_tokens) / len(st)
+
+        def add(menu: List[str], seen: set[str], seg: str) -> None:
+            if not seg:
+                return
+            s = str(seg)
+            if "\n" in s:
+                return
+            s = s.strip()
+            if not s:
+                return
+            if len(s) > MAX_LEN:
+                s = s[:MAX_LEN]
+            if s in seen:
+                return
+            seen.add(s)
+            menu.append(s)
+
+        # Candidates (all extracted as exact substrings or slices thereof).
+        kv_pat = re.compile(
+            r'"[^"\n]{1,60}"\s*:\s*(?:"[^"\n]{0,60}"|-?\d+(?:\.\d+)?|true|false|null)',
+            re.IGNORECASE,
+        )
+        kv = [m.group(0) for m in kv_pat.finditer(txt)]
+
+        quote_pat = re.compile(r'"[^"\n]{1,80}"')
+        quotes = [m.group(0) for m in quote_pat.finditer(txt)]
+
+        nums = re.findall(r"-?\d+(?:\.\d+)?", txt)
+        lines = [ln for ln in txt.splitlines() if ln and ln.strip()]
+
+        # Relevance-sort the "semantic" candidates; keep numbers separately.
+        kv_sorted = sorted(kv, key=lambda s: (-score(s), len(s)))
+        quotes_sorted = sorted(quotes, key=lambda s: (-score(s), len(s)))
+        lines_sorted = sorted(lines, key=lambda s: (-score(s), len(s)))
+
+        menu: List[str] = []
+        seen: set[str] = set()
+
+        # Always include the first non-empty line slice (helpful fallback context).
+        for ln in lines:
+            add(menu, seen, ln)
+            break
+
+        # Prefer structured fragments (JSON-ish key/value pairs).
+        for seg in kv_sorted[: max_spans * 2]:
+            add(menu, seen, seg)
+            if len(menu) >= max_spans:
+                return menu
+
+        # Include a handful of numeric atoms.
+        for n in nums[: max_spans * 2]:
+            add(menu, seen, n)
+            if len(menu) >= max_spans:
+                return menu
+
+        # Fill remaining slots with relevant quoted strings and lines.
+        for seg in quotes_sorted:
+            add(menu, seen, seg)
+            if len(menu) >= max_spans:
+                return menu
+        for seg in lines_sorted:
+            add(menu, seen, seg)
+            if len(menu) >= max_spans:
+                return menu
+
+        return menu[:max_spans]
+
     class _RawClaim(BaseModel):
         text: str
         evidence_ids: List[str]
-        support_spans: List[str]
+        support_span_ids: List[int]
         kind: Literal["fact", "math", "inference"] = "fact"
 
     class _Schema(BaseModel):
@@ -113,8 +204,12 @@ class LLMReasoner(Reasoner):
             return s if len(s) <= n else s[:n]
 
         blocks: List[str] = []
+        span_menus: Dict[str, List[str]] = {}
         for eid, txt in list(evidence_map.items())[:8]:
-            blocks.append(f"[{eid}]\n{_ev_excerpt(txt, 1400)}")
+            menu = self._build_span_menu(txt, user_text, max_spans=14)
+            span_menus[eid] = menu
+            menu_lines = "\n".join([f"{i}: {json.dumps(sp, ensure_ascii=False)}" for i, sp in enumerate(menu)]) or "(empty)"
+            blocks.append(f"[{eid}]\nEXCERPT:\n{_ev_excerpt(txt, 900)}\n\nSPAN_MENU (cite by index):\n{menu_lines}")
 
         sys = (
             "You are a reasoning compiler. Output JSON only.\n"
@@ -122,27 +217,20 @@ class LLMReasoner(Reasoner):
             "Rules (hard):\n"
             "- Output must be small: at most 3 claims.\n"
             "- Each claim MUST cite exactly 1 evidence_id.\n"
-            "- Each claim MUST include 1 or 2 support_spans.\n"
-            "- Each support_span MUST be short (<= 120 chars), with no newlines.\n"
+            "- Each claim MUST include 1 or 2 support_span_ids (integers).\n"
+            "- Each support_span_id MUST be a valid index into the cited evidence's SPAN_MENU.\n"
             "- Keep draft under 200 characters.\n"
-            "- Every claim MUST include evidence_ids (existing IDs) AND support_spans.\n"
-            "- Each support_span MUST be an exact substring of the corresponding evidence text.\n"
-            "- Copy/paste support_spans from the evidence verbatim (including punctuation/quotes).\n"
-            "- Prefer short spans that are easy to match (numbers, IDs, exact JSON fragments).\n"
-            "- Never include the leading [evidence_id] label in support_spans.\n"
+            "- Every claim MUST include evidence_ids (existing IDs) AND support_span_ids.\n"
             "- Output key order MUST be: claims, draft, proactive.\n"
-            "- Claim key order MUST be: text, evidence_ids, support_spans, kind.\n"
+            "- Claim key order MUST be: text, evidence_ids, support_span_ids, kind.\n"
             "- Do NOT introduce facts not supported by evidence.\n"
             "- If evidence is insufficient, return claims=[] and draft='I don't know'.\n\n"
             "- Set proactive=[] unless the user explicitly asked for suggestions.\n\n"
             "Examples (illustrative only; do not copy placeholder IDs):\n"
-            "Evidence: [<EVID>]\\n{\"normalized_expression\":\"10/4\",\"result\":2.5}\n"
-            "Good claim: {\"text\":\"10/4 equals 2.5\",\"evidence_ids\":[\"<EVID>\"],\"support_spans\":[\"2.5\",\"10/4\"],\"kind\":\"math\"}\n"
-            "Bad claim:  {\"text\":\"10/4 equals 2.5\",\"evidence_ids\":[\"<EVID>\"],\"support_spans\":[\"2.50\"],\"kind\":\"math\"}  (span not exact)\n\n"
-            "Evidence: [<EVID>]\\n{\"case_sensitive\":false,\"char\":\"r\",\"count\":2,\"text\":\"strawberry\"}\n"
-            "Good claim: {\"text\":\"The letter r appears 2 time(s) in the word strawberry.\",\"evidence_ids\":[\"<EVID>\"],\"support_spans\":[\"2\",\"strawberry\"],\"kind\":\"math\"}\n\n"
+            "Evidence: [<EVID>] with SPAN_MENU indices.\n"
+            "Good claim: {\"text\":\"10/4 equals 2.5\",\"evidence_ids\":[\"<EVID>\"],\"support_span_ids\":[0,1],\"kind\":\"math\"}\n"
             "Output JSON format:\n"
-            "{claims:[{text,evidence_ids,support_spans,kind}], draft:str, proactive:list}\n"
+            "{claims:[{text,evidence_ids,support_span_ids,kind}], draft:str, proactive:list}\n"
         )
         user = (
             f"User question:\n{user_text}\n\n"
@@ -156,9 +244,31 @@ class LLMReasoner(Reasoner):
         for rc in raw.claims:
             text = str(rc.text or "").strip()
             eids = list(rc.evidence_ids or [])
-            spans = [str(s) for s in (rc.support_spans or []) if str(s).strip()]
-            if text and eids and spans:
-                claims.append(Claim(text=text, evidence_ids=eids, support_spans=spans, kind=rc.kind))
+            span_ids = list(rc.support_span_ids or [])
+            if not (text and eids and span_ids):
+                continue
+            evid = str(eids[0])
+            menu = span_menus.get(evid) or []
+            spans: List[str] = []
+            ok = True
+            for sid in span_ids:
+                try:
+                    i = int(sid)
+                except Exception:
+                    ok = False
+                    break
+                if i < 0 or i >= len(menu):
+                    ok = False
+                    break
+                sp = menu[i]
+                # Safety: ensure it's actually in evidence (should always be true).
+                if sp and (sp in (evidence_map.get(evid, "") or "")):
+                    spans.append(sp)
+                else:
+                    ok = False
+                    break
+            if ok and spans:
+                claims.append(Claim(text=text, evidence_ids=[evid], support_spans=spans, kind=rc.kind))
 
         return ProposedAnswer(claims=claims, draft=str(raw.draft or ""), proactive=list(raw.proactive or []))
 

@@ -1379,32 +1379,107 @@ class LLMReasoner(Reasoner):
         proactive: List[Dict[str, Any]] = Field(default_factory=list)
 
     def propose(self, user_text: str, *, plan: Plan, evidence_map: Dict[str, str], memory_hits: Dict[str, Any], tool_outcomes: List["ToolOutcome"]) -> ProposedAnswer:
+        def _build_span_menu(evidence_text: str, user_text: str, *, max_spans: int = 14) -> List[str]:
+            """
+            Build a small menu of candidate support spans extracted from `evidence_text`.
+
+            The model cites spans by index (support_span_ids), and we map indices back to
+            exact substrings. This avoids brittle exact-copy behavior.
+            """
+            txt = str(evidence_text or "")
+            if not txt:
+                return []
+            MAX_LEN = 120
+            max_spans = max(1, int(max_spans))
+            user_tokens = set(toks(user_text or ""))
+
+            def score(seg: str) -> float:
+                st = set(toks(seg))
+                if not st or not user_tokens:
+                    return 0.0
+                return len(st & user_tokens) / len(st)
+
+            def add(menu: List[str], seen: set, seg: str) -> None:
+                if not seg:
+                    return
+                s = str(seg)
+                if "\n" in s:
+                    return
+                s = s.strip()
+                if not s:
+                    return
+                if len(s) > MAX_LEN:
+                    s = s[:MAX_LEN]
+                if s in seen:
+                    return
+                seen.add(s)
+                menu.append(s)
+
+            kv_pat = re.compile(
+                r'"[^"\n]{1,60}"\s*:\s*(?:"[^"\n]{0,60}"|-?\d+(?:\.\d+)?|true|false|null)',
+                re.IGNORECASE,
+            )
+            kv = [m.group(0) for m in kv_pat.finditer(txt)]
+            quote_pat = re.compile(r'"[^"\n]{1,80}"')
+            quotes = [m.group(0) for m in quote_pat.finditer(txt)]
+            nums = re.findall(r"-?\d+(?:\.\d+)?", txt)
+            lines = [ln for ln in txt.splitlines() if ln and ln.strip()]
+
+            kv_sorted = sorted(kv, key=lambda s: (-score(s), len(s)))
+            quotes_sorted = sorted(quotes, key=lambda s: (-score(s), len(s)))
+            lines_sorted = sorted(lines, key=lambda s: (-score(s), len(s)))
+
+            menu: List[str] = []
+            seen: set = set()
+
+            for ln in lines:
+                add(menu, seen, ln)
+                break
+            for seg in kv_sorted[: max_spans * 2]:
+                add(menu, seen, seg)
+                if len(menu) >= max_spans:
+                    return menu
+            for n in nums[: max_spans * 2]:
+                add(menu, seen, n)
+                if len(menu) >= max_spans:
+                    return menu
+            for seg in quotes_sorted:
+                add(menu, seen, seg)
+                if len(menu) >= max_spans:
+                    return menu
+            for seg in lines_sorted:
+                add(menu, seen, seg)
+                if len(menu) >= max_spans:
+                    return menu
+            return menu[:max_spans]
+
         def _ev_excerpt(s: str, n: int) -> str:
             if not s:
                 return ""
             return s if len(s) <= n else s[:n]
 
         blocks: List[str] = []
-        for eid, txt in list(evidence_map.items())[:12]:
-            blocks.append(f"[{eid}]\n{_ev_excerpt(txt, 4000)}")
+        span_menus: Dict[str, List[str]] = {}
+        for eid, txt in list(evidence_map.items())[:8]:
+            menu = _build_span_menu(txt, user_text, max_spans=14)
+            span_menus[eid] = menu
+            menu_lines = "\n".join([f"{i}: {json.dumps(sp, ensure_ascii=False)}" for i, sp in enumerate(menu)]) or "(empty)"
+            blocks.append(f"[{eid}]\nEXCERPT:\n{_ev_excerpt(txt, 900)}\n\nSPAN_MENU (cite by index):\n{menu_lines}")
 
         sys = (
             "You are a reasoning compiler. Output JSON only.\n"
             "Goal: answer the user using atomic claims grounded in evidence.\n\n"
             "Rules (hard):\n"
-            "- Every claim MUST include evidence_ids (existing IDs) AND support_spans.\n"
-            "- Each support_span MUST be an exact substring of the corresponding evidence text.\n"
-            "- Copy/paste support_spans from the evidence verbatim (including punctuation/quotes).\n"
-            "- Prefer short spans that are easy to match (numbers, IDs, exact JSON fragments).\n"
-            "- Never include the leading [evidence_id] label in support_spans.\n"
+            "- Each claim MUST cite exactly 1 evidence_id.\n"
+            "- Each claim MUST include evidence_ids (existing IDs) AND support_span_ids.\n"
+            "- support_span_ids MUST be 1 or 2 integers indexing into the cited evidence's SPAN_MENU.\n"
             "- Do NOT introduce facts not supported by evidence.\n"
             "- If evidence is insufficient, return claims=[] and draft='I don't know'.\n\n"
             "Examples (illustrative only; do not copy placeholder IDs):\n"
-            "Evidence: [<EVID>]\\n{\"result\": 2.5, \"normalized_expression\": \"10/4\"}\n"
-            "Good claim: {\"text\":\"10/4 equals 2.5\",\"evidence_ids\":[\"<EVID>\"],\"support_spans\":[\"2.5\",\"10/4\"],\"kind\":\"math\"}\n"
-            "Bad claim:  {\"text\":\"10/4 equals 2.5\",\"evidence_ids\":[\"<EVID>\"],\"support_spans\":[\"2.50\"],\"kind\":\"math\"}  (span not exact)\n\n"
+            "Evidence: [<EVID>] with SPAN_MENU indices.\n"
+            "Good claim: {\"text\":\"10/4 equals 2.5\",\"evidence_ids\":[\"<EVID>\"],\"support_span_ids\":[0,1],\"kind\":\"math\"}\n\n"
             "Output JSON format:\n"
-            "{claims:[{text,evidence_ids,support_spans,kind}], draft:str, proactive:list}\n"
+            "{claims:[{text,evidence_ids,support_span_ids,kind}], draft:str, proactive:list}\n"
         )
         user = (
             f"User question:\n{user_text}\n\n"
@@ -1419,10 +1494,31 @@ class LLMReasoner(Reasoner):
             try:
                 text = str(rc.get("text", "")).strip()
                 eids = list(rc.get("evidence_ids") or [])
-                spans = [str(s) for s in (rc.get("support_spans") or []) if str(s).strip()]
+                span_ids = list(rc.get("support_span_ids") or [])
                 kind = rc.get("kind") or "fact"
-                if text and eids and spans:
-                    claims.append(Claim(text=text, evidence_ids=eids, support_spans=spans, kind=kind))
+                if not (text and eids and span_ids):
+                    continue
+                evid = str(eids[0])
+                menu = span_menus.get(evid) or []
+                spans: List[str] = []
+                ok = True
+                for sid in span_ids:
+                    try:
+                        i = int(sid)
+                    except Exception:
+                        ok = False
+                        break
+                    if i < 0 or i >= len(menu):
+                        ok = False
+                        break
+                    sp = menu[i]
+                    if sp and (sp in (evidence_map.get(evid, "") or "")):
+                        spans.append(sp)
+                    else:
+                        ok = False
+                        break
+                if ok and spans:
+                    claims.append(Claim(text=text, evidence_ids=[evid], support_spans=spans, kind=kind))
             except Exception:
                 continue
 
