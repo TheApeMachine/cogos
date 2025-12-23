@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import inspect
 import json
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, TypeVar, cast
 
 from .pyd_compat import BaseModel, _model_json_schema
 from .util import extract_first_json_object, short
+
+
+_TModel = TypeVar("_TModel", bound=BaseModel)
 
 
 _JSON_OBJECT_GBNF = r"""
@@ -158,11 +161,16 @@ class ChatModel:
         raise NotImplementedError
 
     def generate_json(
-        self, messages: List[ChatMessage], schema: type[BaseModel], *, temperature: float = 0.2, max_tokens: int = 1200
-    ) -> BaseModel:
+        self,
+        messages: List[ChatMessage],
+        schema: type[_TModel],
+        *,
+        temperature: float = 0.2,
+        max_tokens: int = 1200,
+    ) -> _TModel:
         txt = self.generate_text(messages, temperature=temperature, max_tokens=max_tokens)
         data = extract_first_json_object(txt)
-        return schema(**data)
+        return cast(_TModel, schema(**data))
 
 
 class StubChatModel(ChatModel):
@@ -289,8 +297,13 @@ class LlamaCppChatModel(ChatModel):
         return self._extract_completion_text(out)
 
     def generate_json(
-        self, messages: List[ChatMessage], schema: type[BaseModel], *, temperature: float = 0.2, max_tokens: int = 1200
-    ) -> BaseModel:
+        self,
+        messages: List[ChatMessage],
+        schema: type[_TModel],
+        *,
+        temperature: float = 0.2,
+        max_tokens: int = 1200,
+    ) -> _TModel:
         grammar = self._build_grammar_for_schema(schema)
 
         txt: str
@@ -303,11 +316,11 @@ class LlamaCppChatModel(ChatModel):
                     )
                 except TypeError:
                     # Some llama-cpp-python versions don't plumb grammar through chat completions; fall back explicitly.
-                    parts: List[str] = []
+                    fallback_parts: List[str] = []
                     for m in messages:
-                        parts.append(f"{m.role.upper()}: {m.content}")
-                    parts.append("ASSISTANT:")
-                    prompt = "\n".join(parts)
+                        fallback_parts.append(f"{m.role.upper()}: {m.content}")
+                    fallback_parts.append("ASSISTANT:")
+                    prompt = "\n".join(fallback_parts)
                     out = self._llm(
                         prompt,
                         max_tokens=int(max_tokens),
@@ -353,4 +366,4 @@ class LlamaCppChatModel(ChatModel):
             data = extract_first_json_object(txt)
         except Exception as e:
             raise ValueError(f"Failed to parse JSON from model output: {short(txt, 600)}") from e
-        return schema(**data)
+        return cast(_TModel, schema(**data))

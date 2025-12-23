@@ -3,20 +3,22 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+from typing import cast
 
 
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
-        payload = {
-            "ts": dt.datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+        payload: dict[str, object] = {
+            "ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds"),
             "level": record.levelname,
             "name": record.name,
             "msg": record.getMessage(),
         }
         if record.exc_info:
             payload["exc_info"] = self.formatException(record.exc_info)
-        if hasattr(record, "extra") and isinstance(record.extra, dict):
-            payload.update(record.extra)
+        extra = record.__dict__.get("extra")
+        if isinstance(extra, dict):
+            payload.update(cast(dict[str, object], extra))
         return json.dumps(payload, ensure_ascii=False)
 
 

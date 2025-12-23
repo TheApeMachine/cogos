@@ -1,22 +1,35 @@
+"""Notary escalation mechanism.
+
+The Notary is a small, internal "hard-line cut" that records an escalation trace
+when the system cannot produce a verified answer after allowed steering.
+"""
+
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import cast, final
 
 from .ir import Plan, VerifiedAnswer
 from .logging_utils import log
 from .memory import MemoryStore
-from .pyd_compat import BaseModel, Field, _model_dump
+from . import pyd_compat
 from .tools import ToolOutcome
 from .util import jdump, short, utc_ts
 
 
-class NotaryReport(BaseModel):
+JsonValue = str | int | float | bool | None | dict[str, "JsonValue"] | list["JsonValue"]
+JsonObject = dict[str, JsonValue]
+
+
+class NotaryReport(pyd_compat.BaseModel):
+    """Structured return value for a Notary escalation."""
+
     escalated: bool
-    task_id: Optional[str] = None
-    evidence_id: Optional[str] = None
+    task_id: str | None = None
+    evidence_id: str | None = None
     reason: str = ""
 
 
+@final
 class Notary:
     """
     Minimal "hard-line cut" mechanism.
@@ -36,17 +49,21 @@ class Notary:
         user_text: str,
         plan: Plan,
         verified: VerifiedAnswer,
-        tool_outcomes: List[ToolOutcome],
+        tool_outcomes: list[ToolOutcome],
         reason: str,
     ) -> NotaryReport:
+        """Record an escalation trace and enqueue a human-review task."""
+
         normalized_reason = str(reason) if reason else "unspecified"
-        payload: Dict[str, Any] = {
+        payload: JsonObject = {
             "ts": utc_ts(),
             "reason": normalized_reason,
             "user_text": user_text,
-            "plan": _model_dump(plan),
-            "verified": _model_dump(verified),
-            "tool_outcomes": [_model_dump(o) for o in (tool_outcomes or [])],
+            "plan": cast(JsonObject, pyd_compat.model_dump(plan)),
+            "verified": cast(JsonObject, pyd_compat.model_dump(verified)),
+            "tool_outcomes": [
+                cast(JsonObject, pyd_compat.model_dump(o)) for o in (tool_outcomes or [])
+            ],
         }
 
         evid = self.memory.add_evidence(
@@ -66,7 +83,11 @@ class Notary:
             "Human review required (CogOS Notary)",
             desc,
             priority=self.priority,
-            payload={"evidence_id": evid, "reason": normalized_reason, "ts": payload["ts"]},
+            payload={
+                "evidence_id": evid,
+                "reason": normalized_reason,
+                "ts": payload["ts"],
+            },
         )
 
         log.warning(
@@ -82,5 +103,3 @@ class Notary:
             evidence_id=evid,
             reason=normalized_reason,
         )
-
-

@@ -36,6 +36,10 @@ class MemoryStore:
         self._fts_ok = False
         self._init_schema()
 
+    @property
+    def fts_ok(self) -> bool:
+        return bool(self._fts_ok)
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()

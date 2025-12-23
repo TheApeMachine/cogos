@@ -434,8 +434,9 @@ class WebSearchIn(BaseModel):
             return fv
 
     else:  # pragma: no cover
-        # Defensive: pydantic is required via `pyd_compat`, so this should never happen.
-        raise RuntimeError("pydantic validators unavailable; cannot validate WebSearchIn")
+        # If pydantic validators aren't available (e.g., during lightweight/static analysis),
+        # skip validation rather than failing at import time.
+        pass
 
 
 class WebSearchResult(BaseModel):

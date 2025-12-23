@@ -1,7 +1,13 @@
+"""CogOS agent runtime.
+
+This module wires together the memory store, tool bus, planner, reasoner, verifier,
+and renderer into a single `CogOS` façade.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Literal, cast, final
 
 from .daemons import (
     BackgroundRunner,
@@ -21,9 +27,9 @@ from .logging_utils import log, setup_logging
 from .model import DEFAULT_HF_MODEL, HFModelSpec, resolve_llama_model_path
 from .memory import MemoryStore
 from .notary import Notary
-from .planner import LLMPlanner, Planner, RulePlanner
-from .pyd_compat import _model_dump
-from .reasoner import ConservativeReasoner, LLMReasoner, Reasoner, SearchReasoner
+from .planner import LLMPlanner, RulePlanner
+from . import pyd_compat
+from .reasoner import ConservativeReasoner, LLMReasoner, SearchReasoner
 from .renderer import Renderer
 from .tools import (
     CalcIn,
@@ -55,11 +61,17 @@ from .tools import (
 from .util import jdump
 from .verifier import Verifier
 
-from .ir import Plan, StepCreateTask, StepMemorySearch, StepRespond, StepToolCall, StepWriteNote
+from .ir import Plan, StepCreateTask, StepMemorySearch, StepToolCall, StepWriteNote
+
+
+JsonValue = str | int | float | bool | None | dict[str, "JsonValue"] | list["JsonValue"]
+JsonObject = dict[str, JsonValue]
 
 
 @dataclass
 class AgentConfig:
+    """Configuration for `CogOS`."""
+
     db: str = "cogos.db"
     session_id: str = "default"
     embedder: Literal["hash", "st"] = "hash"
@@ -72,7 +84,7 @@ class AgentConfig:
     llama_hf_file: str = DEFAULT_HF_MODEL.filename
     llama_hf_rev: str = DEFAULT_HF_MODEL.revision
     llama_ctx: int = 4096
-    llama_threads: Optional[int] = None
+    llama_threads: int | None = None
     llama_gpu_layers: int = 0
     planner: Literal["rule", "llm"] = "rule"
     reasoner: Literal["conservative", "llm", "search"] = "conservative"
@@ -80,13 +92,13 @@ class AgentConfig:
     allow_side_effects: bool = False
     allow_web_search: bool = False
     auto_research: bool = False
-    web_allow_domains: Tuple[str, ...] = ("wikipedia.org", "arxiv.org", "github.com")
-    web_deny_domains: Tuple[str, ...] = ()
+    web_allow_domains: tuple[str, ...] = ("wikipedia.org", "arxiv.org", "github.com")
+    web_deny_domains: tuple[str, ...] = ()
     min_evidence_trust: float = 0.0
     notary: bool = False
     notary_priority: int = 10
-    read_root: Tuple[str, ...] = (".",)
-    write_root: Tuple[str, ...] = (".",)
+    read_root: tuple[str, ...] = (".",)
+    write_root: tuple[str, ...] = (".",)
     prune_episodes: bool = False
     episode_keep_last: int = 200
     episode_prune_batch: int = 50
@@ -98,7 +110,10 @@ class AgentConfig:
     initiative_threshold: float = 0.62
 
 
+@final
 class CogOS:
+    """Main runtime: plan → execute → reason → verify → render."""
+
     def __init__(self, cfg: AgentConfig):
         self.cfg = cfg
         setup_logging(cfg.log_level, json_logs=cfg.json_logs)
@@ -116,13 +131,22 @@ class CogOS:
         self._register_tools()
 
         self.initiative = InitiativeManager(self.memory, threshold=cfg.initiative_threshold)
-        self.verifier = Verifier(self.memory, require_spans=True, min_span_hits=0.5, min_trust_score=cfg.min_evidence_trust)
+        self.verifier = Verifier(
+            self.memory,
+            require_spans=True,
+            min_span_hits=0.5,
+            min_trust_score=cfg.min_evidence_trust,
+        )
         self.renderer = Renderer(self.memory)
         self.notary = Notary(self.memory, priority=cfg.notary_priority) if cfg.notary else None
 
         # LLM
         if cfg.llm_backend == "llama_cpp":
-            default_spec = HFModelSpec(repo_id=cfg.llama_hf_repo, filename=cfg.llama_hf_file, revision=cfg.llama_hf_rev)
+            default_spec = HFModelSpec(
+                repo_id=cfg.llama_hf_repo,
+                filename=cfg.llama_hf_file,
+                revision=cfg.llama_hf_rev,
+            )
             model_path = resolve_llama_model_path(
                 cfg.llama_model,
                 auto_download=cfg.llama_auto_download,
@@ -138,7 +162,7 @@ class CogOS:
         else:
             self.llm = StubChatModel()
 
-        # Configure planner grammar constraints (when supported): only allow tools that are actually runnable.
+        # Configure planner grammar constraints (when supported): only allow runnable tools.
         if isinstance(self.llm, LlamaCppChatModel) and hasattr(self.llm, "set_plan_tool_names"):
             try:
                 allowed_tool_names = [
@@ -147,7 +171,7 @@ class CogOS:
                     if (self.tools.allow_side_effects or (not bool(t.get("side_effects"))))
                 ]
                 self.llm.set_plan_tool_names(allowed_tool_names)
-            except Exception:
+            except (ValueError, TypeError, AttributeError):  # noqa: BLE001
                 # Grammar configuration is a best-effort enhancement; never block startup.
                 pass
 
@@ -172,7 +196,7 @@ class CogOS:
             self.reasoner = ConservativeReasoner()
 
         # background
-        self.bg: Optional[BackgroundRunner] = None
+        self.bg: BackgroundRunner | None = None
         if cfg.background:
             ctx = DaemonContext(
                 memory=self.memory,
@@ -182,7 +206,12 @@ class CogOS:
                 llm=None if cfg.llm_backend == "stub" else self.llm,
                 session_id=cfg.session_id,
             )
-            daemons: List[Daemon] = [ReflectionDaemon(), ConnectionMiner(), ConsistencyAuditor(), TaskSolverDaemon()]
+            daemons: list[Daemon] = [
+                ReflectionDaemon(),
+                ConnectionMiner(),
+                ConsistencyAuditor(),
+                TaskSolverDaemon(),
+            ]
             if cfg.prune_episodes:
                 daemons.insert(
                     1,
@@ -203,7 +232,7 @@ class CogOS:
             cfg.llm_backend,
             cfg.planner,
             cfg.reasoner,
-            self.memory._fts_ok,
+            self.memory.fts_ok,
             extra={
                 "extra": {
                     "db": cfg.db,
@@ -211,20 +240,69 @@ class CogOS:
                     "llm": cfg.llm_backend,
                     "planner": cfg.planner,
                     "reasoner": cfg.reasoner,
-                    "fts": self.memory._fts_ok,
+                    "fts": self.memory.fts_ok,
                 }
             },
         )
 
     def close(self) -> None:
+        """Stop background daemons and close the underlying storage."""
+
         if self.bg:
             self.bg.stop()
         self.memory.close()
         log.info("CogOS stopped")
 
     def _register_tools(self) -> None:
+        def _mem_search_metadata(_inp: object, out: object) -> JsonObject:
+            o = cast(MemSearchOut, out)
+            notes = cast(list[JsonObject], getattr(o, "notes", []) or [])
+            evidence = cast(list[JsonObject], getattr(o, "evidence", []) or [])
+            skills = cast(list[JsonObject], getattr(o, "skills", []) or [])
+            all_items: list[JsonObject] = notes + evidence + skills
+
+            trust_scores: list[float] = []
+            for item in all_items:
+                ts = item.get("trust_score", 0.0)
+                if isinstance(ts, (int, float)):
+                    trust_scores.append(float(ts))
+
+            return {
+                "result_count": int(len(all_items)),
+                "trust_score": float(max(trust_scores or [0.0])),
+            }
+
+        def _web_search_metadata(_inp: object, out: object) -> JsonObject:
+            o = cast(WebSearchOut, out)
+            provider = getattr(o, "provider", "unknown")
+            results = getattr(o, "results", []) or []
+
+            urls: list[JsonValue] = []
+            trust_scores: list[float] = []
+            for r in results[:5]:
+                url = getattr(r, "url", "")
+                if isinstance(url, str) and url:
+                    urls.append(url)
+                ts = getattr(r, "trust_score", 0.0)
+                if isinstance(ts, (int, float)):
+                    trust_scores.append(float(ts))
+
+            return {
+                "provider": str(provider) if provider is not None else "unknown",
+                "result_count": int(len(results)),
+                "source_urls": urls,
+                "trust_score": float(max(trust_scores or [0.0])),
+            }
+
         self.tools.register(
-            ToolSpec("calc", "Safely evaluate arithmetic expressions.", CalcIn, CalcOut, calc_handler, side_effects=False)
+            ToolSpec(
+                "calc",
+                "Safely evaluate arithmetic expressions.",
+                CalcIn,
+                CalcOut,
+                lambda m: calc_handler(cast(CalcIn, m)),
+                side_effects=False,
+            )
         )
         self.tools.register(
             ToolSpec(
@@ -232,39 +310,31 @@ class CogOS:
                 "Count occurrences of a character in a string.",
                 CountCharsIn,
                 CountCharsOut,
-                count_chars_handler,
+                lambda m: count_chars_handler(cast(CountCharsIn, m)),
                 side_effects=False,
             )
         )
-        self.tools.register(ToolSpec("now", "Get current local time.", NowIn, NowOut, now_handler, side_effects=False))
+        self.tools.register(
+            ToolSpec(
+                "now",
+                "Get current local time.",
+                NowIn,
+                NowOut,
+                lambda m: now_handler(cast(NowIn, m)),
+                side_effects=False,
+            )
+        )
         self.tools.register(
             ToolSpec(
                 "memory_search",
                 "Search notes/evidence/skills (hybrid lexical+vector).",
                 MemSearchIn,
                 MemSearchOut,
-                make_mem_search_handler(self.memory),
+                lambda m: make_mem_search_handler(self.memory)(cast(MemSearchIn, m)),
                 side_effects=False,
                 source_type="memory_search",
                 default_trust_score=0.5,
-                evidence_metadata_builder=lambda _inp, out: {
-                    "result_count": len(getattr(out, "notes", []) or [])
-                    + len(getattr(out, "evidence", []) or [])
-                    + len(getattr(out, "skills", []) or []),
-                    "trust_score": max(
-                        [
-                            float((n or {}).get("trust_score", 0.0))
-                            for n in (getattr(out, "notes", []) or [])
-                            if isinstance(n, dict)
-                        ]
-                        + [
-                            float((e or {}).get("trust_score", 0.0))
-                            for e in (getattr(out, "evidence", []) or [])
-                            if isinstance(e, dict)
-                        ]
-                        or [0.0]
-                    ),
-                },
+                evidence_metadata_builder=_mem_search_metadata,
             )
         )
         self.tools.register(
@@ -273,7 +343,7 @@ class CogOS:
                 "Read a UTF-8 text file under allowed roots.",
                 ReadFileIn,
                 ReadFileOut,
-                make_read_file_handler(self.cfg.read_root),
+                lambda m: make_read_file_handler(self.cfg.read_root)(cast(ReadFileIn, m)),
                 side_effects=False,
             )
         )
@@ -283,7 +353,7 @@ class CogOS:
                 "Write a UTF-8 text file under allowed roots.",
                 WriteFileIn,
                 WriteFileOut,
-                make_write_file_handler(self.cfg.write_root),
+                lambda m: make_write_file_handler(self.cfg.write_root)(cast(WriteFileIn, m)),
                 side_effects=True,
             )
         )
@@ -294,32 +364,29 @@ class CogOS:
                     "Search the web (best-effort, allowlist filtered).",
                     WebSearchIn,
                     WebSearchOut,
-                    make_web_search_handler(
+                    lambda m: make_web_search_handler(
                         allow_domains=self.cfg.web_allow_domains,
                         deny_domains=self.cfg.web_deny_domains,
-                    ),
+                    )(cast(WebSearchIn, m)),
                     side_effects=False,
                     source_type="web_search",
                     default_trust_score=0.35,
-                    evidence_metadata_builder=lambda _inp, out: {
-                        "provider": getattr(out, "provider", "unknown"),
-                        "result_count": len(getattr(out, "results", []) or []),
-                        "source_urls": [r.url for r in (getattr(out, "results", []) or [])[:5] if getattr(r, "url", "")],
-                        "trust_score": max([float(getattr(r, "trust_score", 0.0)) for r in (getattr(out, "results", []) or [])] or [0.0]),
-                    },
+                    evidence_metadata_builder=_web_search_metadata,
                 )
             )
 
-    def handle(self, user_text: str) -> tuple[str, List[Dict[str, Any]]]:
+    def handle(self, user_text: str) -> tuple[str, list[JsonObject]]:
+        """Handle a single user turn and return `(response, proactive_items)`."""
+
         # episodic log: user
         ep_user = self.memory.add_episode(self.cfg.session_id, "user", user_text, metadata={})
-        self.bus.publish("episode_added", {"episode_id": ep_user, "role": "user"})
+        _ = self.bus.publish("episode_added", {"episode_id": ep_user, "role": "user"})
 
         plan: Plan = self.planner.plan(user_text, tools=self.tools, memory=self.memory)
 
-        tool_outcomes: List[ToolOutcome] = []
-        evidence_ids: List[str] = []
-        memory_hits: Dict[str, Any] = {"notes": [], "evidence": [], "skills": []}
+        tool_outcomes: list[ToolOutcome] = []
+        evidence_ids: list[str] = []
+        memory_hits: JsonObject = {"notes": [], "evidence": [], "skills": []}
 
         # Execute plan
         for step in plan.steps:
@@ -331,7 +398,7 @@ class CogOS:
                 if out.evidence_id:
                     evidence_ids.append(out.evidence_id)
                 if out.ok:
-                    memory_hits = out.output
+                    memory_hits = cast(JsonObject, out.output)
 
             elif isinstance(step, StepToolCall):
                 out = self.tools.execute(ToolCall(name=step.tool, arguments=step.arguments))
@@ -347,32 +414,51 @@ class CogOS:
                     source_ids=[ep_user],
                     confidence=step.confidence,
                 )
-                self.bus.publish("note_added", {"note_id": nid})
-                ev = self.memory.add_evidence("note_write", jdump({"note_id": nid, "title": step.title}), metadata={})
+                _ = self.bus.publish("note_added", {"note_id": nid})
+                ev = self.memory.add_evidence(
+                    "note_write",
+                    jdump({"note_id": nid, "title": step.title}),
+                    metadata={},
+                )
                 evidence_ids.append(ev)
 
             elif isinstance(step, StepCreateTask):
-                tid = self.memory.add_task(step.title, step.description, priority=step.priority, payload=step.payload)
-                self.bus.publish("task_added", {"task_id": tid})
-                ev = self.memory.add_evidence("task_create", jdump({"task_id": tid, "title": step.title}), metadata={})
+                tid = self.memory.add_task(
+                    step.title,
+                    step.description,
+                    priority=step.priority,
+                    payload=step.payload,
+                )
+                _ = self.bus.publish("task_added", {"task_id": tid})
+                ev = self.memory.add_evidence(
+                    "task_create",
+                    jdump({"task_id": tid, "title": step.title}),
+                    metadata={},
+                )
                 evidence_ids.append(ev)
 
-            elif isinstance(step, StepRespond):
+            else:
+                # StepRespond (or unknown future step types) is handled after the loop.
                 pass
 
-        # Optional self-hydration: if memory search found nothing and web_search is enabled, try gathering evidence.
+        # Optional self-hydration: if memory search is empty and web_search is
+        # enabled, gather evidence.
         if self.cfg.auto_research and self.cfg.allow_web_search:
             had_mem_search = any(o.ok and o.tool == "memory_search" for o in tool_outcomes)
             had_web_search = any(o.ok and o.tool == "web_search" for o in tool_outcomes)
-            empty_hits = not (memory_hits.get("notes") or memory_hits.get("evidence") or memory_hits.get("skills"))
+            empty_hits = not (
+                memory_hits.get("notes") or memory_hits.get("evidence") or memory_hits.get("skills")
+            )
             if had_mem_search and empty_hits and (not had_web_search):
-                out = self.tools.execute(ToolCall(name="web_search", arguments={"query": user_text, "k": 5}))
+                out = self.tools.execute(
+                    ToolCall(name="web_search", arguments={"query": user_text, "k": 5})
+                )
                 tool_outcomes.append(out)
                 if out.evidence_id:
                     evidence_ids.append(out.evidence_id)
 
         # Evidence map for reasoner
-        evidence_map: Dict[str, str] = {}
+        evidence_map: dict[str, str] = {}
         for eid in evidence_ids:
             ev = self.memory.get_evidence(eid)
             if ev:
@@ -388,7 +474,7 @@ class CogOS:
         verified = self.verifier.verify(proposed)
         response = self.renderer.render(verified)
 
-        # Notary: if we attempted steering via auto-research and still can't verify, cut the hard-line and escalate.
+        # Notary: if auto-research ran and we still can't verify, cut the hard-line and escalate.
         if (
             self.notary is not None
             and (not verified.ok)
@@ -396,7 +482,7 @@ class CogOS:
             and self.cfg.allow_web_search
             and any(o.tool == "web_search" for o in tool_outcomes)
         ):
-            self.notary.escalate(
+            _ = self.notary.escalate(
                 user_text=user_text,
                 plan=plan,
                 verified=verified,
@@ -413,9 +499,12 @@ class CogOS:
             self.cfg.session_id,
             "assistant",
             response,
-            metadata={"plan": _model_dump(plan)},
+            metadata={"plan": pyd_compat.model_dump(plan)},
         )
-        self.bus.publish("episode_added", {"episode_id": ep_bot, "role": "assistant"})
+        _ = self.bus.publish(
+            "episode_added",
+            {"episode_id": ep_bot, "role": "assistant"},
+        )
 
-        proactive = self.initiative.poll(limit=3)
+        proactive = cast(list[JsonObject], self.initiative.poll(limit=3))
         return response, proactive

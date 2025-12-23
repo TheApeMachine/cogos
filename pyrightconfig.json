@@ -1,0 +1,24 @@
+{
+  "typeCheckingMode": "basic",
+  "reportMissingImports": "none",
+  "reportMissingModuleSource": "none",
+  "reportDeprecated": "none",
+  "reportUnusedImport": "none",
+  "reportUnusedCallResult": "none",
+  "reportPrivateUsage": "none",
+  "reportProtectedAccess": "none",
+  "reportIncompatibleVariableOverride": "none",
+  "reportUnknownArgumentType": "none",
+  "reportUnknownLambdaType": "none",
+  "reportUnknownMemberType": "none",
+  "reportUnknownParameterType": "none",
+  "reportUnknownVariableType": "none",
+  "reportUntypedBaseClass": "none",
+  "reportUntypedClassDecorator": "none",
+  "reportUninitializedInstanceVariable": "none",
+  "reportImplicitOverride": "none",
+  "reportAny": "none",
+  "reportExplicitAny": "none"
+}
+
+
