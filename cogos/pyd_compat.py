@@ -32,14 +32,18 @@ def Field(  # noqa: D103
 
 
 try:  # pragma: no cover
-    from pydantic import BaseModel as _PBaseModel
-    from pydantic import Field as _PField
-    from pydantic import ValidationError as _PValidationError
+    # NOTE: We intentionally avoid `import pydantic` here because static type-checkers
+    # will report a missing import if pydantic isn't installed in the analysis env.
+    # Using importlib keeps the dependency runtime-optional while still enabling it
+    # when present.
+    import importlib
 
-    BaseModel = _PBaseModel
-    Field = _PField
-    ValidationError = _PValidationError
+    _pyd = importlib.import_module("pydantic")
+    BaseModel = cast(Any, getattr(_pyd, "BaseModel"))
+    Field = cast(Any, getattr(_pyd, "Field"))
+    ValidationError = cast(Any, getattr(_pyd, "ValidationError"))
 except Exception:
+    # Keep the lightweight runtime stubs above.
     pass
 
 

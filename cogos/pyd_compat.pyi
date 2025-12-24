@@ -26,12 +26,7 @@ def Field(
 ) -> T: ...
 
 @overload
-def Field(*, default_factory: None = ..., **kwargs: object) -> object: ...
-
-
-@overload
 def Field(
-    default: object = ...,
     *,
     default_factory: Callable[[], T],
     **kwargs: object,

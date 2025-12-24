@@ -68,6 +68,19 @@ class Verifier:
                 else c.copy(update={"status": "rejected", "score": 0.0})
             )  # type: ignore
 
+        # Critical: spans must also appear in the claim text itself.
+        #
+        # Otherwise a model can "launder" an unsupported claim by citing arbitrary
+        # substrings that happen to exist in evidence (e.g. JSON keys), while the
+        # claim text says something else entirely.
+        claim_txt = str(c.text or "")
+        if spans and any(sp not in claim_txt for sp in spans):
+            return (
+                c.model_copy(update={"status": "rejected", "score": 0.0})
+                if hasattr(c, "model_copy")
+                else c.copy(update={"status": "rejected", "score": 0.0})
+            )  # type: ignore
+
         hit = 0
         for sp in spans:
             found = any(sp in txt for txt in ev_texts.values())

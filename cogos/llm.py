@@ -117,18 +117,14 @@ def build_plan_gbnf(tool_names: Sequence[str]) -> str:
 _REASONER_GBNF = r"""
 root ::= answer
 
-answer ::= "{" ws "\"claims\"" ws ":" ws claims ws "," ws "\"draft\"" ws ":" ws string ws "," ws "\"proactive\"" ws ":" ws objectarray ws "}" ws
+answer ::= "{" ws "\"claims\"" ws ":" ws claims ws "," ws "\"draft\"" ws ":" ws string ws "," ws "\"proactive\"" ws ":" ws "[" ws "]" ws "}" ws
 
-claims ::= "[" ws "]" ws
-       | "[" ws claim ws "]" ws
-       | "[" ws claim ws "," ws claim ws "]" ws
-       | "[" ws claim ws "," ws claim ws "," ws claim ws "]" ws
+claims ::= "[" ws "]" ws | "[" ws claim ws "]" ws | "[" ws claim ws "," ws claim ws "]" ws | "[" ws claim ws "," ws claim ws "," ws claim ws "]" ws
 
 claim ::= "{" ws "\"text\"" ws ":" ws string ws "," ws "\"evidence_ids\"" ws ":" ws evidlist ws "," ws "\"support_span_ids\"" ws ":" ws spanidlist ws "," ws "\"kind\"" ws ":" ws kind "}" ws
 
 evidlist ::= "[" ws string ws "]" ws
-spanidlist ::= "[" ws int ws "]" ws
-           | "[" ws int ws "," ws int ws "]" ws
+spanidlist ::= "[" ws int ws "]" ws | "[" ws int ws "," ws int ws "]" ws
 
 kind ::= "\"fact\"" ws | "\"math\"" ws | "\"inference\"" ws
 
@@ -138,9 +134,7 @@ object ::= "{" ws ( member (ws "," ws member)* )? "}" ws
 member ::= string ":" ws value
 
 array ::= "[" ws ( value (ws "," ws value)* )? "]" ws
-objectarray ::= "[" ws "]" ws
-            | "[" ws object ws "]" ws
-            | "[" ws object ws "," ws object ws "]" ws
+objectarray ::= "[" ws "]" ws | "[" ws object ws "]" ws | "[" ws object ws "," ws object ws "]" ws
 stringarray ::= "[" ws ( string (ws "," ws string)* )? "]" ws
 
 string ::= "\"" ( [^"\\] | "\\" ( ["\\/bfnrt] | "u" [0-9a-fA-F]{4} ) )* "\"" ws
@@ -157,6 +151,8 @@ class ChatMessage(BaseModel):
 
 
 class ChatModel:
+    name: str = "chat_model"
+
     def generate_text(self, messages: List[ChatMessage], *, temperature: float = 0.2, max_tokens: int = 800) -> str:
         raise NotImplementedError
 
@@ -174,14 +170,24 @@ class ChatModel:
 
 
 class StubChatModel(ChatModel):
+    name = "stub"
+
     def generate_text(self, messages: List[ChatMessage], *, temperature: float = 0.0, max_tokens: int = 256) -> str:
         # Always abstain; forces grounded/tool-only behavior.
         return json.dumps({"claims": [], "draft": "I don't know.", "proactive": []})
 
 
 class LlamaCppChatModel(ChatModel):
+    name = "llama_cpp"
+
     def __init__(
-        self, model_path: str, *, n_ctx: int = 4096, n_threads: Optional[int] = None, n_gpu_layers: int = 0
+        self,
+        model_path: str,
+        *,
+        n_ctx: int = 4096,
+        n_threads: Optional[int] = None,
+        n_gpu_layers: int = 0,
+        verbose: bool = False,
     ):
         try:
             from llama_cpp import Llama  # type: ignore
@@ -191,12 +197,17 @@ class LlamaCppChatModel(ChatModel):
             from llama_cpp import LlamaGrammar  # type: ignore
         except Exception:
             LlamaGrammar = None  # type: ignore[assignment]
-        self._llm = Llama(
-            model_path=model_path,
-            n_ctx=int(n_ctx),
-            n_threads=n_threads,
-            n_gpu_layers=int(n_gpu_layers),
-        )
+        # Construct kwargs defensively to support multiple llama-cpp-python versions.
+        init_sig = inspect.signature(getattr(Llama, "__init__"))
+        llm_kwargs: Dict[str, Any] = {
+            "model_path": model_path,
+            "n_ctx": int(n_ctx),
+            "n_threads": n_threads,
+            "n_gpu_layers": int(n_gpu_layers),
+        }
+        if "verbose" in init_sig.parameters:
+            llm_kwargs["verbose"] = bool(verbose)
+        self._llm = Llama(**llm_kwargs)
         self._grammar_cls = LlamaGrammar
         self._plan_tool_names: Optional[List[str]] = None
 
@@ -264,13 +275,19 @@ class LlamaCppChatModel(ChatModel):
             return None
         if schema.__module__ == "cogos.ir" and schema.__name__ == "Plan" and hasattr(self._grammar_cls, "from_string"):
             gbnf = build_plan_gbnf(self._plan_tool_names or [])
-            return self._grammar_cls.from_string(gbnf)  # type: ignore[no-any-return]
+            try:
+                return self._grammar_cls.from_string(gbnf)  # type: ignore[no-any-return]
+            except Exception:
+                return None
         if (
             schema.__module__ == "cogos.reasoner"
             and schema.__qualname__.endswith("LLMReasoner._Schema")
             and hasattr(self._grammar_cls, "from_string")
         ):
-            return self._grammar_cls.from_string(_REASONER_GBNF)  # type: ignore[no-any-return]
+            try:
+                return self._grammar_cls.from_string(_REASONER_GBNF)  # type: ignore[no-any-return]
+            except Exception:
+                return None
         if hasattr(self._grammar_cls, "from_json_schema"):
             try:
                 schema_json = json.dumps(_model_json_schema(schema))
@@ -278,7 +295,10 @@ class LlamaCppChatModel(ChatModel):
             except Exception:
                 pass
         if hasattr(self._grammar_cls, "from_string"):
-            return self._grammar_cls.from_string(_JSON_OBJECT_GBNF)  # type: ignore[no-any-return]
+            try:
+                return self._grammar_cls.from_string(_JSON_OBJECT_GBNF)  # type: ignore[no-any-return]
+            except Exception:
+                return None
         return None
 
     def generate_text(self, messages: List[ChatMessage], *, temperature: float = 0.2, max_tokens: int = 800) -> str:
@@ -366,4 +386,128 @@ class LlamaCppChatModel(ChatModel):
             data = extract_first_json_object(txt)
         except Exception as e:
             raise ValueError(f"Failed to parse JSON from model output: {short(txt, 600)}") from e
+        return cast(_TModel, schema(**data))
+
+
+class OllamaChatModel(ChatModel):
+    """
+    Minimal Ollama backend (no extra deps).
+
+    Uses the local Ollama HTTP API (default host: http://localhost:11434).
+    """
+
+    name = "ollama"
+
+    def __init__(self, *, host: str = "http://localhost:11434", model: str = ""):
+        self.host = (host or "").rstrip("/") or "http://localhost:11434"
+        self.model = model.strip()
+        if not self.model:
+            self.model = self._pick_default_model()
+
+    def _url(self, path: str) -> str:
+        p = path if path.startswith("/") else ("/" + path)
+        return self.host + p
+
+    def _pick_default_model(self) -> str:
+        """
+        Pick the first installed Ollama model (via /api/tags).
+        """
+        import urllib.request
+
+        try:
+            with urllib.request.urlopen(self._url("/api/tags"), timeout=1.5) as r:  # noqa: S310
+                raw = r.read().decode("utf-8", errors="replace")
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(
+                "Ollama is not reachable. Start Ollama and ensure it listens on "
+                f"{self.host} (or pass --ollama-host)."
+            ) from e
+
+        try:
+            data = json.loads(raw)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"Failed to parse Ollama /api/tags response: {short(raw, 400)}") from e
+
+        models = data.get("models") or []
+        for m in models:
+            if isinstance(m, dict) and isinstance(m.get("name"), str) and m["name"].strip():
+                return m["name"].strip()
+        raise RuntimeError(
+            "Ollama is running, but no models are installed. Run `ollama pull <model>` "
+            "or pass --ollama-model."
+        )
+
+    def _chat(self, messages: List[ChatMessage], *, temperature: float, max_tokens: int, want_json: bool) -> str:
+        import urllib.request
+        import urllib.error
+
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "stream": False,
+            "options": {
+                "temperature": float(temperature),
+                "num_predict": int(max_tokens),
+            },
+        }
+
+        # Best-effort JSON constraint: some Ollama versions support format="json".
+        if want_json:
+            payload["format"] = "json"
+
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            self._url("/api/chat"),
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        def _do(req_: "urllib.request.Request") -> str:
+            with urllib.request.urlopen(req_, timeout=60.0) as r:  # noqa: S310
+                raw = r.read().decode("utf-8", errors="replace")
+            try:
+                data = json.loads(raw)
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(f"Ollama returned non-JSON: {short(raw, 600)}") from e
+            msg = (data.get("message") or {}) if isinstance(data, dict) else {}
+            content = msg.get("content") if isinstance(msg, dict) else None
+            return str(content or "").strip()
+
+        try:
+            return _do(req)
+        except urllib.error.HTTPError as e:
+            # Retry without format if server doesn't accept it.
+            try:
+                raw = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                raw = ""
+            if want_json and ("format" in raw.lower() or "unknown field" in raw.lower()):
+                payload.pop("format", None)
+                body2 = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                req2 = urllib.request.Request(
+                    self._url("/api/chat"),
+                    data=body2,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                return _do(req2)
+            raise RuntimeError(f"Ollama HTTP error: {e.code} {short(raw, 600)}") from e
+
+    def generate_text(self, messages: List[ChatMessage], *, temperature: float = 0.2, max_tokens: int = 800) -> str:
+        return self._chat(messages, temperature=temperature, max_tokens=max_tokens, want_json=False)
+
+    def generate_json(
+        self,
+        messages: List[ChatMessage],
+        schema: type[_TModel],
+        *,
+        temperature: float = 0.2,
+        max_tokens: int = 1200,
+    ) -> _TModel:
+        txt = self._chat(messages, temperature=temperature, max_tokens=max_tokens, want_json=True)
+        try:
+            data = extract_first_json_object(txt)
+        except Exception as e:  # noqa: BLE001
+            raise ValueError(f"Failed to parse JSON from Ollama output: {short(txt, 600)}") from e
         return cast(_TModel, schema(**data))

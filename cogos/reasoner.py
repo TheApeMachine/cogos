@@ -226,11 +226,7 @@ class LLMReasoner(Reasoner):
             "- Do NOT introduce facts not supported by evidence.\n"
             "- If evidence is insufficient, return claims=[] and draft='I don't know'.\n\n"
             "- Set proactive=[] unless the user explicitly asked for suggestions.\n\n"
-            "Examples (illustrative only; do not copy placeholder IDs):\n"
-            "Evidence: [<EVID>] with SPAN_MENU indices.\n"
-            "Good claim: {\"text\":\"10/4 equals 2.5\",\"evidence_ids\":[\"<EVID>\"],\"support_span_ids\":[0,1],\"kind\":\"math\"}\n"
-            "Output JSON format:\n"
-            "{claims:[{text,evidence_ids,support_span_ids,kind}], draft:str, proactive:list}\n"
+            "Return ONLY the JSON object. Do not include examples or extra text.\n"
         )
         user = (
             f"User question:\n{user_text}\n\n"
@@ -238,7 +234,11 @@ class LLMReasoner(Reasoner):
             "Return JSON only."
         )
         msgs = [ChatMessage(role="system", content=sys), ChatMessage(role="user", content=user)]
-        raw = self.model.generate_json(msgs, self._Schema, temperature=0.2, max_tokens=1200)
+        try:
+            raw = self.model.generate_json(msgs, self._Schema, temperature=0.15, max_tokens=600)
+        except Exception:
+            # Hard fail-safe: never crash the agent loop due to model JSON issues.
+            return ProposedAnswer(claims=[], draft="I don't know.", proactive=[])
 
         claims: List[Claim] = []
         for rc in raw.claims:
@@ -331,13 +331,16 @@ class SearchReasoner(Reasoner):
         best_score = -1.0
 
         for _ in range(self.samples):
-            cand = self.base.propose(
-                user_text,
-                plan=plan,
-                evidence_map=evidence_map,
-                memory_hits=memory_hits,
-                tool_outcomes=tool_outcomes,
-            )
+            try:
+                cand = self.base.propose(
+                    user_text,
+                    plan=plan,
+                    evidence_map=evidence_map,
+                    memory_hits=memory_hits,
+                    tool_outcomes=tool_outcomes,
+                )
+            except Exception:
+                cand = ProposedAnswer(claims=[], draft="I don't know.", proactive=[])
 
             # Score candidate by how supported its claims look.
             if not cand.claims:

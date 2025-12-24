@@ -7,7 +7,7 @@ and renderer into a single `CogOS` façade.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, cast, final
+from typing import Any, Callable, Literal, cast, final
 
 from .daemons import (
     BackgroundRunner,
@@ -22,7 +22,7 @@ from .daemons import (
 from .embeddings import EmbeddingModel, HashEmbed, SentenceTransformerEmbed
 from .event_bus import EventBus
 from .initiative import InitiativeManager
-from .llm import ChatModel, LlamaCppChatModel, StubChatModel
+from .llm import ChatModel, LlamaCppChatModel, OllamaChatModel, StubChatModel
 from .logging_utils import log, setup_logging
 from .model import DEFAULT_HF_MODEL, HFModelSpec, resolve_llama_model_path
 from .memory import MemoryStore
@@ -76,7 +76,7 @@ class AgentConfig:
     session_id: str = "default"
     embedder: Literal["hash", "st"] = "hash"
     st_model: str = "all-MiniLM-L6-v2"
-    llm_backend: Literal["stub", "llama_cpp"] = "stub"
+    llm_backend: Literal["auto", "stub", "llama_cpp", "ollama"] = "auto"
     llama_model: str = ""
     llama_model_dir: str = "models"
     llama_auto_download: bool = False
@@ -86,15 +86,20 @@ class AgentConfig:
     llama_ctx: int = 4096
     llama_threads: int | None = None
     llama_gpu_layers: int = 0
-    planner: Literal["rule", "llm"] = "rule"
-    reasoner: Literal["conservative", "llm", "search"] = "conservative"
+    llama_verbose: bool = False
+    ollama_host: str = "http://localhost:11434"
+    ollama_model: str = ""
+    planner: Literal["rule", "llm"] = "llm"
+    reasoner: Literal["conservative", "llm", "search"] = "search"
     search_samples: int = 4
     allow_side_effects: bool = False
     allow_web_search: bool = False
     auto_research: bool = False
     web_allow_domains: tuple[str, ...] = ("wikipedia.org", "arxiv.org", "github.com")
     web_deny_domains: tuple[str, ...] = ()
-    min_evidence_trust: float = 0.0
+    # Default: reject low-trust evidence such as conversation-derived notes.
+    # Web allowlisted domains typically score >= 0.6; conversation fragments cap at ~0.35.
+    min_evidence_trust: float = 0.5
     notary: bool = False
     notary_priority: int = 10
     read_root: tuple[str, ...] = (".",)
@@ -117,6 +122,7 @@ class CogOS:
     def __init__(self, cfg: AgentConfig):
         self.cfg = cfg
         setup_logging(cfg.log_level, json_logs=cfg.json_logs)
+        self.last_trace: dict[str, Any] | None = None
 
         # embedder
         if cfg.embedder == "st":
@@ -140,8 +146,11 @@ class CogOS:
         self.renderer = Renderer(self.memory)
         self.notary = Notary(self.memory, priority=cfg.notary_priority) if cfg.notary else None
 
-        # LLM
-        if cfg.llm_backend == "llama_cpp":
+        # LLM (auto resolves to a real backend; never silently "show up as AI" while using stub).
+        self.llm: ChatModel
+        llm_errs: list[str] = []
+
+        def _try_llama_cpp() -> ChatModel:
             default_spec = HFModelSpec(
                 repo_id=cfg.llama_hf_repo,
                 filename=cfg.llama_hf_file,
@@ -153,14 +162,42 @@ class CogOS:
                 model_dir=cfg.llama_model_dir,
                 default_spec=default_spec,
             )
-            self.llm: ChatModel = LlamaCppChatModel(
+            return LlamaCppChatModel(
                 model_path,
                 n_ctx=cfg.llama_ctx,
                 n_threads=cfg.llama_threads,
                 n_gpu_layers=cfg.llama_gpu_layers,
+                verbose=cfg.llama_verbose,
             )
-        else:
+
+        def _try_ollama() -> ChatModel:
+            return OllamaChatModel(host=cfg.ollama_host, model=cfg.ollama_model)
+
+        if cfg.llm_backend == "stub":
             self.llm = StubChatModel()
+        elif cfg.llm_backend == "ollama":
+            self.llm = _try_ollama()
+        elif cfg.llm_backend == "llama_cpp":
+            self.llm = _try_llama_cpp()
+        else:
+            # auto: try llama.cpp first, then Ollama, otherwise fail with a helpful error.
+            try:
+                self.llm = _try_llama_cpp()
+            except Exception as e1:  # noqa: BLE001
+                llm_errs.append(f"llama_cpp: {type(e1).__name__}: {e1}")
+                try:
+                    self.llm = _try_ollama()
+                except Exception as e2:  # noqa: BLE001
+                    llm_errs.append(f"ollama: {type(e2).__name__}: {e2}")
+                    raise RuntimeError(
+                        "No usable LLM backend found.\n\n"
+                        "Fix options:\n"
+                        "- Install llama-cpp-python: pip install -r requirements-llama.txt\n"
+                        "- OR run Ollama locally and install a model: `ollama pull llama3.2` (then use --llm-backend ollama)\n"
+                        "- OR explicitly run in deterministic mode: --llm-backend stub\n\n"
+                        "Details:\n- "
+                        + "\n- ".join(llm_errs)
+                    ) from e2
 
         # Configure planner grammar constraints (when supported): only allow runnable tools.
         if isinstance(self.llm, LlamaCppChatModel) and hasattr(self.llm, "set_plan_tool_names"):
@@ -177,20 +214,20 @@ class CogOS:
 
         # planner
         if cfg.planner == "llm":
-            if cfg.llm_backend == "stub":
-                raise ValueError("--planner llm requires --llm-backend != stub")
+            if isinstance(self.llm, StubChatModel):
+                raise ValueError("--planner llm requires a real LLM backend (try --llm-backend llama_cpp|ollama|auto)")
             self.planner = LLMPlanner(self.llm)
         else:
             self.planner = RulePlanner()
 
         # reasoner
         if cfg.reasoner == "llm":
-            if cfg.llm_backend == "stub":
-                raise ValueError("--reasoner llm requires --llm-backend != stub")
+            if isinstance(self.llm, StubChatModel):
+                raise ValueError("--reasoner llm requires a real LLM backend (try --llm-backend llama_cpp|ollama|auto)")
             self.reasoner = LLMReasoner(self.llm)
         elif cfg.reasoner == "search":
-            if cfg.llm_backend == "stub":
-                raise ValueError("--reasoner search requires --llm-backend != stub")
+            if isinstance(self.llm, StubChatModel):
+                raise ValueError("--reasoner search requires a real LLM backend (try --llm-backend llama_cpp|ollama|auto)")
             self.reasoner = SearchReasoner(LLMReasoner(self.llm), samples=cfg.search_samples)
         else:
             self.reasoner = ConservativeReasoner()
@@ -229,7 +266,7 @@ class CogOS:
             "CogOS started (db=%s, embedder=%s, llm=%s, planner=%s, reasoner=%s, fts=%s)",
             cfg.db,
             embedder.name,
-            cfg.llm_backend,
+            getattr(self.llm, "name", cfg.llm_backend),
             cfg.planner,
             cfg.reasoner,
             self.memory.fts_ok,
@@ -237,7 +274,7 @@ class CogOS:
                 "extra": {
                     "db": cfg.db,
                     "embedder": embedder.name,
-                    "llm": cfg.llm_backend,
+                    "llm": getattr(self.llm, "name", cfg.llm_backend),
                     "planner": cfg.planner,
                     "reasoner": cfg.reasoner,
                     "fts": self.memory.fts_ok,
@@ -267,9 +304,12 @@ class CogOS:
                 if isinstance(ts, (int, float)):
                     trust_scores.append(float(ts))
 
+            # Do not override the tool execution trust_score: `memory_search` is a retrieval
+            # tool, not a source of truth. We record the max trust of returned items as
+            # a separate metadata field for debugging/inspection.
             return {
                 "result_count": int(len(all_items)),
-                "trust_score": float(max(trust_scores or [0.0])),
+                "max_item_trust_score": float(max(trust_scores or [0.0])),
             }
 
         def _web_search_metadata(_inp: object, out: object) -> JsonObject:
@@ -375,34 +415,67 @@ class CogOS:
                 )
             )
 
-    def handle(self, user_text: str) -> tuple[str, list[JsonObject]]:
+    def handle(
+        self,
+        user_text: str,
+        *,
+        on_trace: Callable[[str, JsonObject], None] | None = None,
+    ) -> tuple[str, list[JsonObject]]:
         """Handle a single user turn and return `(response, proactive_items)`."""
+
+        def _trace(kind: str, payload: JsonObject) -> None:
+            if on_trace is None:
+                return
+            try:
+                on_trace(kind, payload)
+            except Exception:
+                # Trace hooks are best-effort; never break the agent loop.
+                return
 
         # episodic log: user
         ep_user = self.memory.add_episode(self.cfg.session_id, "user", user_text, metadata={})
         _ = self.bus.publish("episode_added", {"episode_id": ep_user, "role": "user"})
 
         plan: Plan = self.planner.plan(user_text, tools=self.tools, memory=self.memory)
+        _trace("plan", cast(JsonObject, pyd_compat.model_dump(plan)))
 
         tool_outcomes: list[ToolOutcome] = []
         evidence_ids: list[str] = []
         memory_hits: JsonObject = {"notes": [], "evidence": [], "skills": []}
 
+        def _max_hit_trust(hits: JsonObject) -> float:
+            best = 0.0
+            for k in ("notes", "evidence", "skills"):
+                items = hits.get(k) or []
+                if not isinstance(items, list):
+                    continue
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    ts = it.get("trust_score", 0.0)
+                    if isinstance(ts, (int, float)):
+                        best = max(best, float(ts))
+            return float(best)
+
         # Execute plan
         for step in plan.steps:
             if isinstance(step, StepMemorySearch):
+                _trace("tool_call", {"tool": "memory_search", "arguments": {"query": step.query, "k": step.k}})
                 out = self.tools.execute(
                     ToolCall(name="memory_search", arguments={"query": step.query, "k": step.k})
                 )
                 tool_outcomes.append(out)
+                _trace("tool_outcome", cast(JsonObject, pyd_compat.model_dump(out)))
                 if out.evidence_id:
                     evidence_ids.append(out.evidence_id)
                 if out.ok:
                     memory_hits = cast(JsonObject, out.output)
 
             elif isinstance(step, StepToolCall):
+                _trace("tool_call", {"tool": step.tool, "arguments": cast(JsonObject, step.arguments)})
                 out = self.tools.execute(ToolCall(name=step.tool, arguments=step.arguments))
                 tool_outcomes.append(out)
+                _trace("tool_outcome", cast(JsonObject, pyd_compat.model_dump(out)))
                 if out.evidence_id:
                     evidence_ids.append(out.evidence_id)
 
@@ -421,6 +494,7 @@ class CogOS:
                     metadata={},
                 )
                 evidence_ids.append(ev)
+                _trace("evidence", {"evidence_id": ev, "kind": "note_write"})
 
             elif isinstance(step, StepCreateTask):
                 tid = self.memory.add_task(
@@ -436,6 +510,7 @@ class CogOS:
                     metadata={},
                 )
                 evidence_ids.append(ev)
+                _trace("evidence", {"evidence_id": ev, "kind": "task_create"})
 
             else:
                 # StepRespond (or unknown future step types) is handled after the loop.
@@ -449,11 +524,29 @@ class CogOS:
             empty_hits = not (
                 memory_hits.get("notes") or memory_hits.get("evidence") or memory_hits.get("skills")
             )
-            if had_mem_search and empty_hits and (not had_web_search):
+            max_hit_trust = _max_hit_trust(memory_hits)
+            # Treat low-trust hits as "effectively empty" for the purpose of auto-research.
+            # This prevents the agent from skipping web_search just because it found
+            # conversation fragments or other low-trust items in memory.
+            insufficient_hits = empty_hits or (max_hit_trust < float(self.cfg.min_evidence_trust))
+            _trace(
+                "auto_research_gate",
+                {
+                    "had_mem_search": bool(had_mem_search),
+                    "had_web_search": bool(had_web_search),
+                    "empty_hits": bool(empty_hits),
+                    "max_hit_trust": float(max_hit_trust),
+                    "min_evidence_trust": float(self.cfg.min_evidence_trust),
+                    "insufficient_hits": bool(insufficient_hits),
+                },
+            )
+            if had_mem_search and insufficient_hits and (not had_web_search):
+                _trace("tool_call", {"tool": "web_search", "arguments": {"query": user_text, "k": 5}})
                 out = self.tools.execute(
                     ToolCall(name="web_search", arguments={"query": user_text, "k": 5})
                 )
                 tool_outcomes.append(out)
+                _trace("tool_outcome", cast(JsonObject, pyd_compat.model_dump(out)))
                 if out.evidence_id:
                     evidence_ids.append(out.evidence_id)
 
@@ -473,6 +566,17 @@ class CogOS:
         )
         verified = self.verifier.verify(proposed)
         response = self.renderer.render(verified)
+
+        # Store last trace for TUI introspection.
+        try:
+            self.last_trace = {
+                "plan": cast(JsonObject, pyd_compat.model_dump(plan)),
+                "tool_outcomes": [cast(JsonObject, pyd_compat.model_dump(o)) for o in tool_outcomes],
+                "evidence_ids": [str(e) for e in evidence_ids],
+                "verified": cast(JsonObject, pyd_compat.model_dump(verified)),
+            }
+        except Exception:
+            self.last_trace = None
 
         # Notary: if auto-research ran and we still can't verify, cut the hard-line and escalate.
         if (

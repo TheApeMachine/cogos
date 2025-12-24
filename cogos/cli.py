@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import os
 import signal
+import sys
 import threading
+import time
 import traceback
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .agent import AgentConfig, CogOS
 from .model import HFModelSpec, ensure_hf_model
@@ -23,11 +26,109 @@ def _install_sigint_handler(stop_flag: threading.Event) -> None:
     signal.signal(signal.SIGTERM, _h)
 
 
+class _Style:
+    def __init__(self, enabled: bool):
+        self.enabled = bool(enabled)
+
+    def _wrap(self, code: str, s: str) -> str:
+        if not self.enabled:
+            return s
+        return f"\033[{code}m{s}\033[0m"
+
+    def dim(self, s: str) -> str:
+        return self._wrap("2", s)
+
+    def bold(self, s: str) -> str:
+        return self._wrap("1", s)
+
+    def red(self, s: str) -> str:
+        return self._wrap("31", s)
+
+    def green(self, s: str) -> str:
+        return self._wrap("32", s)
+
+    def yellow(self, s: str) -> str:
+        return self._wrap("33", s)
+
+    def cyan(self, s: str) -> str:
+        return self._wrap("36", s)
+
+
+class _Spinner:
+    def __init__(self, *, enabled: bool, text: str = "working"):
+        self.enabled = bool(enabled)
+        self.text = text
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._th: threading.Thread | None = None
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+        if self._th and self._th.is_alive():
+            return
+        self._stop.clear()
+        self._th = threading.Thread(target=self._run, name="cogos-spinner", daemon=True)
+        self._th.start()
+
+    def stop(self) -> None:
+        if not self.enabled:
+            return
+        self._stop.set()
+        th = self._th
+        if th:
+            th.join(timeout=0.5)
+        with self._lock:
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+
+    def println(self, s: str) -> None:
+        # Print without fighting the spinner line.
+        if not self.enabled:
+            print(s)
+            return
+        with self._lock:
+            sys.stdout.write("\r\033[K")
+            sys.stdout.write(s + "\n")
+            sys.stdout.flush()
+
+    def _run(self) -> None:
+        frames = ["|", "/", "-", "\\"]
+        i = 0
+        while not self._stop.is_set():
+            with self._lock:
+                sys.stdout.write(f"\r{frames[i % len(frames)]} {self.text}...\033[K")
+                sys.stdout.flush()
+            i += 1
+            time.sleep(0.08)
+
+
+def _pretty_json_or_text(s: str) -> Tuple[str, bool]:
+    """
+    Best-effort pretty print for JSON strings.
+    Returns (text, was_json).
+    """
+    txt = str(s or "").strip()
+    if not txt:
+        return "", False
+    try:
+        obj = json.loads(txt)
+    except Exception:
+        return txt, False
+    try:
+        return json.dumps(obj, ensure_ascii=False, sort_keys=True, indent=2), True
+    except Exception:
+        return txt, True
+
+
 def cmd_chat(args: argparse.Namespace) -> int:
     if args.web_allow_domain is None:
         web_allow_domain = ["wikipedia.org", "arxiv.org", "github.com"]
     else:
         web_allow_domain = args.web_allow_domain
+
+    planner = args.planner or ("rule" if args.llm_backend == "stub" else "llm")
+    reasoner = args.reasoner or ("conservative" if args.llm_backend == "stub" else "search")
 
     cfg = AgentConfig(
         db=args.db,
@@ -44,8 +145,11 @@ def cmd_chat(args: argparse.Namespace) -> int:
         llama_ctx=args.llama_ctx,
         llama_threads=args.llama_threads,
         llama_gpu_layers=args.llama_gpu_layers,
-        planner=args.planner,
-        reasoner=args.reasoner,
+        llama_verbose=args.llama_verbose,
+        ollama_host=args.ollama_host,
+        ollama_model=args.ollama_model,
+        planner=planner,
+        reasoner=reasoner,
         search_samples=args.search_samples,
         allow_side_effects=args.allow_side_effects,
         allow_web_search=args.allow_web_search,
@@ -73,13 +177,29 @@ def cmd_chat(args: argparse.Namespace) -> int:
     _install_sigint_handler(stop_flag)
 
     try:
+        llm_name = getattr(agent.llm, "name", str(agent.cfg.llm_backend))
+        is_tty = sys.stdout.isatty()
+        style = _Style(enabled=is_tty and (not args.no_color))
+        spinner = _Spinner(enabled=is_tty and (not args.no_spinner), text="thinking")
+        show_tools = bool(args.show_tools)
+
+        print(style.dim("—" * 72))
         print(
-            f"CogOS production baseline (llm={agent.cfg.llm_backend}, planner={agent.cfg.planner}, reasoner={agent.cfg.reasoner}). "
-            "/help for commands. Ctrl-C or /quit to exit.\n"
+            style.bold("CogOS")
+            + " "
+            + style.dim(f"(llm={llm_name}, planner={agent.cfg.planner}, reasoner={agent.cfg.reasoner})")
         )
+        print(style.dim("Type /help for commands. Ctrl-C or /quit to exit."))
+        print(style.dim("—" * 72) + "\n")
+        if llm_name == "stub":
+            print(
+                style.yellow("NOTE: ")
+                + "You are running with the stub LLM backend (deterministic, tool/memory-only mode). "
+                "Use `--llm-backend auto|llama_cpp|ollama` for a real LLM.\n"
+            )
         while not stop_flag.is_set():
             try:
-                user = input("you> ").strip()
+                user = input(style.green("you> ") if style.enabled else "you> ").strip()
             except EOFError:
                 break
             except KeyboardInterrupt:
@@ -101,6 +221,9 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 print("  /tasks               list tasks")
                 print("  /task add <title>::<desc>   create a task")
                 print("  /poll                show proactive messages")
+                print("  /ev <evidence_id> [full]    show evidence content")
+                print("  /trace               show last plan + tool outcomes")
+                print("  /show tools          toggle tool-call tracing")
                 print("  /quit                exit")
                 continue
 
@@ -160,15 +283,132 @@ def cmd_chat(args: argparse.Namespace) -> int:
                     print(f"[initiative score={m['score']:.2f}] {m['message']}")
                 continue
 
-            # --- normal turn ---
-            try:
-                ans, proactive = agent.handle(user)
-            except Exception as e:
-                print(f"bot> ERROR: {e}")
-                traceback.print_exc()
+            if user.startswith("/show "):
+                rest = user[len("/show ") :].strip().lower()
+                if rest in ("tools", "tool", "trace"):
+                    show_tools = not show_tools
+                    print(f"show_tools={show_tools}")
+                else:
+                    print("Usage: /show tools")
                 continue
 
-            print(f"bot> {ans}")
+            if user.startswith("/ev ") or user.startswith("/evidence "):
+                parts = user.split()
+                if len(parts) < 2:
+                    print("Usage: /ev <evidence_id> [full]")
+                    continue
+                evid = parts[1].strip()
+                full = any(p.lower() == "full" for p in parts[2:])
+                ev = agent.memory.get_evidence(evid)
+                if not ev:
+                    print(style.red("No such evidence: ") + evid)
+                    continue
+                md = ev.get("metadata") or {}
+                hdr = f"{ev.get('id')}  kind={ev.get('kind')}  ts={ev.get('ts')}"
+                print(style.bold(hdr) if style.enabled else hdr)
+                try:
+                    ts = float(md.get("trust_score", 0.0))
+                except Exception:
+                    ts = 0.0
+                src = str(md.get("source_type", md.get("tool", "")) or "")
+                meta_line = f"source={src} trust_score={ts:.2f}" if src else f"trust_score={ts:.2f}"
+                print(style.dim(meta_line) if style.enabled else meta_line)
+                content = str(ev.get("content") or "")
+                pretty, was_json = _pretty_json_or_text(content)
+                if (not full) and len(pretty) > 2200:
+                    pretty = pretty[:2199] + "…"
+                label = "content (json):" if was_json else "content:"
+                print(style.dim(label) if style.enabled else label)
+                print(pretty)
+                continue
+
+            if user == "/trace":
+                tr = agent.last_trace or {}
+                plan = tr.get("plan") or {}
+                steps = (plan.get("steps") or []) if isinstance(plan, dict) else []
+                if steps:
+                    hdr = "plan:"
+                    print(style.bold(hdr) if style.enabled else hdr)
+                    for st in steps:
+                        if not isinstance(st, dict):
+                            continue
+                        t = st.get("type")
+                        if t == "tool_call":
+                            print(f"  - tool_call {st.get('tool')} args={st.get('arguments')}")
+                        elif t == "memory_search":
+                            print(f"  - memory_search query={short(str(st.get('query','')), 80)} k={st.get('k')}")
+                        else:
+                            print(f"  - {t}")
+                outs = tr.get("tool_outcomes") or []
+                if outs:
+                    hdr = "tool outcomes:"
+                    print(style.bold(hdr) if style.enabled else hdr)
+                    for o in outs:
+                        if not isinstance(o, dict):
+                            continue
+                        tool = o.get("tool")
+                        ok = bool(o.get("ok"))
+                        evid = o.get("evidence_id")
+                        line = f"  - {tool} ok={ok}"
+                        if evid:
+                            line += f" evidence={evid}"
+                        if (not ok) and o.get("error"):
+                            line += f" error={short(str(o.get('error')), 160)}"
+                        print(line)
+                verified = tr.get("verified") or {}
+                claims = (verified.get("claims") or []) if isinstance(verified, dict) else []
+                if claims:
+                    hdr = "verified claims:"
+                    print(style.bold(hdr) if style.enabled else hdr)
+                    for c in claims:
+                        if not isinstance(c, dict):
+                            continue
+                        txt = str(c.get("text") or "").strip()
+                        kind = str(c.get("kind") or "")
+                        score = c.get("score")
+                        eids = c.get("evidence_ids") or []
+                        spans = c.get("support_spans") or []
+                        print(f"  - ({kind}) score={score} evidence={eids}")
+                        print(f"    text: {short(txt, 180)}")
+                        if spans:
+                            print(f"    spans: {spans}")
+                if not steps and not outs:
+                    print("(no trace available yet)")
+                continue
+
+            # --- normal turn ---
+            def _on_trace(kind: str, payload: Dict[str, Any]) -> None:
+                if not show_tools:
+                    return
+                if kind == "tool_call":
+                    tool = str(payload.get("tool") or "")
+                    args_ = payload.get("arguments") or {}
+                    line = f"{style.dim('→') if style.enabled else '->'} tool {tool} {style.dim(str(args_)) if style.enabled else str(args_)}"
+                    spinner.println(line)
+                elif kind == "tool_outcome":
+                    ok = bool(payload.get("ok"))
+                    tool = str(payload.get("tool") or "")
+                    evid = str(payload.get("evidence_id") or "")
+                    if ok:
+                        spinner.println(f"{style.dim('←') if style.enabled else '<-'} tool {tool} ok evidence={evid}")
+                    else:
+                        err = short(str(payload.get('error') or ''), 160)
+                        spinner.println(f"{style.dim('←') if style.enabled else '<-'} tool {tool} ERROR {err}")
+
+            try:
+                spinner.start()
+                ans, proactive = agent.handle(user, on_trace=_on_trace)
+            except Exception as e:
+                spinner.stop()
+                if style.enabled:
+                    print(style.cyan("bot> ") + style.red(f"ERROR: {e}"))
+                else:
+                    print(f"bot> ERROR: {e}")
+                traceback.print_exc()
+                continue
+            finally:
+                spinner.stop()
+            print((style.cyan("bot> ") if style.enabled else "bot> ") + ans)
             for pm in proactive:
                 print(f"\n[initiative score={pm['score']:.2f}] {pm['message']}\n")
     finally:
@@ -263,7 +503,7 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--embedder", choices=["hash", "st"], default="hash")
     chat.add_argument("--st-model", default="all-MiniLM-L6-v2")
 
-    chat.add_argument("--llm-backend", choices=["stub", "llama_cpp"], default="stub")
+    chat.add_argument("--llm-backend", choices=["auto", "llama_cpp", "ollama", "stub"], default="auto")
     chat.add_argument(
         "--llama-model",
         default=os.environ.get("COGOS_LLAMA_MODEL", ""),
@@ -277,9 +517,13 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--llama-ctx", type=int, default=int(os.environ.get("COGOS_LLAMA_CTX", "4096")))
     chat.add_argument("--llama-threads", type=int, default=None)
     chat.add_argument("--llama-gpu-layers", type=int, default=int(os.environ.get("COGOS_LLAMA_GPU_LAYERS", "0")))
+    chat.add_argument("--llama-verbose", action="store_true", help="Enable verbose llama.cpp logging.")
 
-    chat.add_argument("--planner", choices=["rule", "llm"], default="rule")
-    chat.add_argument("--reasoner", choices=["conservative", "llm", "search"], default="conservative")
+    chat.add_argument("--ollama-host", default=os.environ.get("COGOS_OLLAMA_HOST", "http://localhost:11434"))
+    chat.add_argument("--ollama-model", default=os.environ.get("COGOS_OLLAMA_MODEL", ""))
+
+    chat.add_argument("--planner", choices=["rule", "llm"], default=None)
+    chat.add_argument("--reasoner", choices=["conservative", "llm", "search"], default=None)
     chat.add_argument("--search-samples", type=int, default=4)
 
     chat.add_argument("--allow-side-effects", action="store_true")
@@ -291,7 +535,7 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument(
         "--auto-research",
         action="store_true",
-        help="If memory_search yields no hits, automatically run web_search once to gather evidence (context firewall).",
+        help="If memory_search yields no hits (or only low-trust hits), automatically run web_search once to gather evidence (context firewall).",
     )
     chat.add_argument(
         "--web-allow-domain",
@@ -308,7 +552,7 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument(
         "--min-evidence-trust",
         type=float,
-        default=0.0,
+        default=0.5,
         help="Verifier threshold: reject claims that cite evidence with trust_score below this value (0.0-1.0).",
     )
     chat.add_argument(
@@ -340,6 +584,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     chat.add_argument("--log-level", default="INFO")
     chat.add_argument("--json-logs", action="store_true")
+    chat.add_argument("--no-color", action="store_true", help="Disable ANSI colors.")
+    chat.add_argument("--no-spinner", action="store_true", help="Disable the in-progress spinner.")
+    chat.add_argument("--show-tools", action="store_true", help="Show tool calls/outcomes for each turn.")
 
     chat.set_defaults(func=cmd_chat)
 

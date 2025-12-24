@@ -111,8 +111,16 @@ def resolve_llama_model_path(
         return str(ensure_hf_model(hf_spec, model_dir=model_dir_path))
 
     if not m:
+        # If the default model is already present on disk, use it even when
+        # auto_download is disabled. (No network, no surprise downloads.)
+        default_path = model_dir_path / "hf" / spec.repo_id / spec.revision / spec.filename
+        if default_path.exists():
+            return str(default_path.resolve())
         if not auto_download:
-            raise ValueError("--llama-model is required (or use --llama-auto-download / --llama-model hf://...)")
+            raise ValueError(
+                "--llama-model is required (or place the default model under models/hf/..., "
+                "or use --llama-auto-download / --llama-model hf://...)"
+            )
         return str(ensure_hf_model(spec, model_dir=model_dir_path))
 
     p = Path(m).expanduser()

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List
+from typing import Dict, List
 
 from .ir import VerifiedAnswer
 from .memory import MemoryStore
@@ -21,7 +21,19 @@ class Renderer:
         if v.warnings:
             lines.append("⚠️ " + " ".join(v.warnings))
         lines.append("Here’s what I can support from evidence:")
+
+        # De-noise: merge duplicate claim texts and aggregate evidence IDs.
+        by_text: Dict[str, List[str]] = {}
         for c in v.claims:
-            lines.append(f"- {c.text}  [evidence: {', '.join(c.evidence_ids)}]")
+            txt = str(c.text or "").strip()
+            if not txt:
+                continue
+            by_text.setdefault(txt, [])
+            for eid in c.evidence_ids:
+                if eid and eid not in by_text[txt]:
+                    by_text[txt].append(eid)
+
+        for txt, eids in by_text.items():
+            lines.append(f"- {txt}  [evidence: {', '.join(eids)}]")
         return "\n".join(lines)
 
