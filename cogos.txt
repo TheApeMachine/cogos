@@ -1,0 +1,4975 @@
+Directory Structure:
+
+└── ./
+    ├── cogos
+    │   ├── __init__.py
+    │   ├── agent.py
+    │   ├── cli.py
+    │   ├── daemons.py
+    │   ├── embeddings.py
+    │   ├── event_bus.py
+    │   ├── initiative.py
+    │   ├── ir.py
+    │   ├── llm.py
+    │   ├── logging_utils.py
+    │   ├── memory.py
+    │   ├── model.py
+    │   ├── notary.py
+    │   ├── np_compat.py
+    │   ├── planner.py
+    │   ├── pyd_compat.py
+    │   ├── pyd_compat.pyi
+    │   ├── reasoner.py
+    │   ├── renderer.py
+    │   ├── tools.py
+    │   ├── util.py
+    │   └── verifier.py
+    └── cogos.py
+
+
+
+---
+File: /cogos/__init__.py
+---
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .agent import AgentConfig, CogOS
+    from .cli import main
+
+__all__ = ["AgentConfig", "CogOS", "main"]
+
+
+def __getattr__(name: str):  # pragma: no cover
+    # Lazy exports to avoid importing heavy dependencies at package import time.
+    if name in {"AgentConfig", "CogOS"}:
+        from .agent import AgentConfig, CogOS
+
+        return {"AgentConfig": AgentConfig, "CogOS": CogOS}[name]
+    if name == "main":
+        from .cli import main
+
+        return main
+    raise AttributeError(name)
+
+
+
+
+---
+File: /cogos/agent.py
+---
+
+"""CogOS agent runtime.
+
+This module wires together the memory store, tool bus, planner, reasoner, verifier,
+and renderer into a single `CogOS` façade.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal, cast, final
+
+from .daemons import (
+    BackgroundRunner,
+    ConnectionMiner,
+    ConsistencyAuditor,
+    Daemon,
+    DaemonContext,
+    PruningDaemon,
+    ReflectionDaemon,
+    TaskSolverDaemon,
+)
+from .embeddings import EmbeddingModel, HashEmbed, SentenceTransformerEmbed
+from .event_bus import EventBus
+from .initiative import InitiativeManager
+from .llm import ChatModel, LlamaCppChatModel, StubChatModel
+from .logging_utils import log, setup_logging
+from .model import DEFAULT_HF_MODEL, HFModelSpec, resolve_llama_model_path
+from .memory import MemoryStore
+from .notary import Notary
+from .planner import LLMPlanner, RulePlanner
+from . import pyd_compat
+from .reasoner import ConservativeReasoner, LLMReasoner, SearchReasoner
+from .renderer import Renderer
+from .tools import (
+    CalcIn,
+    CalcOut,
+    CountCharsIn,
+    CountCharsOut,
+    MemSearchIn,
+    MemSearchOut,
+    NowIn,
+    NowOut,
+    ReadFileIn,
+    ReadFileOut,
+    ToolBus,
+    ToolCall,
+    ToolOutcome,
+    ToolSpec,
+    WebSearchIn,
+    WebSearchOut,
+    WriteFileIn,
+    WriteFileOut,
+    calc_handler,
+    count_chars_handler,
+    make_mem_search_handler,
+    make_read_file_handler,
+    make_web_search_handler,
+    make_write_file_handler,
+    now_handler,
+)
+from .util import jdump
+from .verifier import Verifier
+
+from .ir import Plan, StepCreateTask, StepMemorySearch, StepToolCall, StepWriteNote
+
+
+JsonValue = str | int | float | bool | None | dict[str, "JsonValue"] | list["JsonValue"]
+JsonObject = dict[str, JsonValue]
+
+
+@dataclass
+class AgentConfig:
+    """Configuration for `CogOS`."""
+
+    db: str = "cogos.db"
+    session_id: str = "default"
+    embedder: Literal["hash", "st"] = "hash"
+    st_model: str = "all-MiniLM-L6-v2"
+    llm_backend: Literal["stub", "llama_cpp"] = "stub"
+    llama_model: str = ""
+    llama_model_dir: str = "models"
+    llama_auto_download: bool = False
+    llama_hf_repo: str = DEFAULT_HF_MODEL.repo_id
+    llama_hf_file: str = DEFAULT_HF_MODEL.filename
+    llama_hf_rev: str = DEFAULT_HF_MODEL.revision
+    llama_ctx: int = 4096
+    llama_threads: int | None = None
+    llama_gpu_layers: int = 0
+    planner: Literal["rule", "llm"] = "rule"
+    reasoner: Literal["conservative", "llm", "search"] = "conservative"
+    search_samples: int = 4
+    allow_side_effects: bool = False
+    allow_web_search: bool = False
+    auto_research: bool = False
+    web_allow_domains: tuple[str, ...] = ("wikipedia.org", "arxiv.org", "github.com")
+    web_deny_domains: tuple[str, ...] = ()
+    min_evidence_trust: float = 0.0
+    notary: bool = False
+    notary_priority: int = 10
+    read_root: tuple[str, ...] = (".",)
+    write_root: tuple[str, ...] = (".",)
+    prune_episodes: bool = False
+    episode_keep_last: int = 200
+    episode_prune_batch: int = 50
+    episode_digest_chars: int = 280
+    episode_digest_confidence: float = 0.55
+    background: bool = True
+    json_logs: bool = False
+    log_level: str = "INFO"
+    initiative_threshold: float = 0.62
+
+
+@final
+class CogOS:
+    """Main runtime: plan → execute → reason → verify → render."""
+
+    def __init__(self, cfg: AgentConfig):
+        self.cfg = cfg
+        setup_logging(cfg.log_level, json_logs=cfg.json_logs)
+
+        # embedder
+        if cfg.embedder == "st":
+            embedder: EmbeddingModel = SentenceTransformerEmbed(cfg.st_model)
+        else:
+            embedder = HashEmbed(384)
+
+        self.bus = EventBus()
+        self.memory = MemoryStore(cfg.db, embedder=embedder)
+
+        self.tools = ToolBus(self.memory, self.bus, allow_side_effects=cfg.allow_side_effects)
+        self._register_tools()
+
+        self.initiative = InitiativeManager(self.memory, threshold=cfg.initiative_threshold)
+        self.verifier = Verifier(
+            self.memory,
+            require_spans=True,
+            min_span_hits=0.5,
+            min_trust_score=cfg.min_evidence_trust,
+        )
+        self.renderer = Renderer(self.memory)
+        self.notary = Notary(self.memory, priority=cfg.notary_priority) if cfg.notary else None
+
+        # LLM
+        if cfg.llm_backend == "llama_cpp":
+            default_spec = HFModelSpec(
+                repo_id=cfg.llama_hf_repo,
+                filename=cfg.llama_hf_file,
+                revision=cfg.llama_hf_rev,
+            )
+            model_path = resolve_llama_model_path(
+                cfg.llama_model,
+                auto_download=cfg.llama_auto_download,
+                model_dir=cfg.llama_model_dir,
+                default_spec=default_spec,
+            )
+            self.llm: ChatModel = LlamaCppChatModel(
+                model_path,
+                n_ctx=cfg.llama_ctx,
+                n_threads=cfg.llama_threads,
+                n_gpu_layers=cfg.llama_gpu_layers,
+            )
+        else:
+            self.llm = StubChatModel()
+
+        # Configure planner grammar constraints (when supported): only allow runnable tools.
+        if isinstance(self.llm, LlamaCppChatModel) and hasattr(self.llm, "set_plan_tool_names"):
+            try:
+                allowed_tool_names = [
+                    t["name"]
+                    for t in self.tools.list_tools()
+                    if (self.tools.allow_side_effects or (not bool(t.get("side_effects"))))
+                ]
+                self.llm.set_plan_tool_names(allowed_tool_names)
+            except (ValueError, TypeError, AttributeError):  # noqa: BLE001
+                # Grammar configuration is a best-effort enhancement; never block startup.
+                pass
+
+        # planner
+        if cfg.planner == "llm":
+            if cfg.llm_backend == "stub":
+                raise ValueError("--planner llm requires --llm-backend != stub")
+            self.planner = LLMPlanner(self.llm)
+        else:
+            self.planner = RulePlanner()
+
+        # reasoner
+        if cfg.reasoner == "llm":
+            if cfg.llm_backend == "stub":
+                raise ValueError("--reasoner llm requires --llm-backend != stub")
+            self.reasoner = LLMReasoner(self.llm)
+        elif cfg.reasoner == "search":
+            if cfg.llm_backend == "stub":
+                raise ValueError("--reasoner search requires --llm-backend != stub")
+            self.reasoner = SearchReasoner(LLMReasoner(self.llm), samples=cfg.search_samples)
+        else:
+            self.reasoner = ConservativeReasoner()
+
+        # background
+        self.bg: BackgroundRunner | None = None
+        if cfg.background:
+            ctx = DaemonContext(
+                memory=self.memory,
+                tools=self.tools,
+                initiative=self.initiative,
+                bus=self.bus,
+                llm=None if cfg.llm_backend == "stub" else self.llm,
+                session_id=cfg.session_id,
+            )
+            daemons: list[Daemon] = [
+                ReflectionDaemon(),
+                ConnectionMiner(),
+                ConsistencyAuditor(),
+                TaskSolverDaemon(),
+            ]
+            if cfg.prune_episodes:
+                daemons.insert(
+                    1,
+                    PruningDaemon(
+                        keep_last=cfg.episode_keep_last,
+                        batch=cfg.episode_prune_batch,
+                        digest_chars=cfg.episode_digest_chars,
+                        confidence=cfg.episode_digest_confidence,
+                    ),
+                )
+            self.bg = BackgroundRunner(self.bus, ctx, daemons)
+            self.bg.start()
+
+        log.info(
+            "CogOS started (db=%s, embedder=%s, llm=%s, planner=%s, reasoner=%s, fts=%s)",
+            cfg.db,
+            embedder.name,
+            cfg.llm_backend,
+            cfg.planner,
+            cfg.reasoner,
+            self.memory.fts_ok,
+            extra={
+                "extra": {
+                    "db": cfg.db,
+                    "embedder": embedder.name,
+                    "llm": cfg.llm_backend,
+                    "planner": cfg.planner,
+                    "reasoner": cfg.reasoner,
+                    "fts": self.memory.fts_ok,
+                }
+            },
+        )
+
+    def close(self) -> None:
+        """Stop background daemons and close the underlying storage."""
+
+        if self.bg:
+            self.bg.stop()
+        self.memory.close()
+        log.info("CogOS stopped")
+
+    def _register_tools(self) -> None:
+        def _mem_search_metadata(_inp: object, out: object) -> JsonObject:
+            o = cast(MemSearchOut, out)
+            notes = cast(list[JsonObject], getattr(o, "notes", []) or [])
+            evidence = cast(list[JsonObject], getattr(o, "evidence", []) or [])
+            skills = cast(list[JsonObject], getattr(o, "skills", []) or [])
+            all_items: list[JsonObject] = notes + evidence + skills
+
+            trust_scores: list[float] = []
+            for item in all_items:
+                ts = item.get("trust_score", 0.0)
+                if isinstance(ts, (int, float)):
+                    trust_scores.append(float(ts))
+
+            return {
+                "result_count": int(len(all_items)),
+                "trust_score": float(max(trust_scores or [0.0])),
+            }
+
+        def _web_search_metadata(_inp: object, out: object) -> JsonObject:
+            o = cast(WebSearchOut, out)
+            provider = getattr(o, "provider", "unknown")
+            results = getattr(o, "results", []) or []
+
+            urls: list[JsonValue] = []
+            trust_scores: list[float] = []
+            for r in results[:5]:
+                url = getattr(r, "url", "")
+                if isinstance(url, str) and url:
+                    urls.append(url)
+                ts = getattr(r, "trust_score", 0.0)
+                if isinstance(ts, (int, float)):
+                    trust_scores.append(float(ts))
+
+            return {
+                "provider": str(provider) if provider is not None else "unknown",
+                "result_count": int(len(results)),
+                "source_urls": urls,
+                "trust_score": float(max(trust_scores or [0.0])),
+            }
+
+        self.tools.register(
+            ToolSpec(
+                "calc",
+                "Safely evaluate arithmetic expressions.",
+                CalcIn,
+                CalcOut,
+                lambda m: calc_handler(cast(CalcIn, m)),
+                side_effects=False,
+            )
+        )
+        self.tools.register(
+            ToolSpec(
+                "count_chars",
+                "Count occurrences of a character in a string.",
+                CountCharsIn,
+                CountCharsOut,
+                lambda m: count_chars_handler(cast(CountCharsIn, m)),
+                side_effects=False,
+            )
+        )
+        self.tools.register(
+            ToolSpec(
+                "now",
+                "Get current local time.",
+                NowIn,
+                NowOut,
+                lambda m: now_handler(cast(NowIn, m)),
+                side_effects=False,
+            )
+        )
+        self.tools.register(
+            ToolSpec(
+                "memory_search",
+                "Search notes/evidence/skills (hybrid lexical+vector).",
+                MemSearchIn,
+                MemSearchOut,
+                lambda m: make_mem_search_handler(self.memory)(cast(MemSearchIn, m)),
+                side_effects=False,
+                source_type="memory_search",
+                default_trust_score=0.5,
+                evidence_metadata_builder=_mem_search_metadata,
+            )
+        )
+        self.tools.register(
+            ToolSpec(
+                "read_text_file",
+                "Read a UTF-8 text file under allowed roots.",
+                ReadFileIn,
+                ReadFileOut,
+                lambda m: make_read_file_handler(self.cfg.read_root)(cast(ReadFileIn, m)),
+                side_effects=False,
+            )
+        )
+        self.tools.register(
+            ToolSpec(
+                "write_text_file",
+                "Write a UTF-8 text file under allowed roots.",
+                WriteFileIn,
+                WriteFileOut,
+                lambda m: make_write_file_handler(self.cfg.write_root)(cast(WriteFileIn, m)),
+                side_effects=True,
+            )
+        )
+        if self.cfg.allow_web_search:
+            self.tools.register(
+                ToolSpec(
+                    "web_search",
+                    "Search the web (best-effort, allowlist filtered).",
+                    WebSearchIn,
+                    WebSearchOut,
+                    lambda m: make_web_search_handler(
+                        allow_domains=self.cfg.web_allow_domains,
+                        deny_domains=self.cfg.web_deny_domains,
+                    )(cast(WebSearchIn, m)),
+                    side_effects=False,
+                    source_type="web_search",
+                    default_trust_score=0.35,
+                    evidence_metadata_builder=_web_search_metadata,
+                )
+            )
+
+    def handle(self, user_text: str) -> tuple[str, list[JsonObject]]:
+        """Handle a single user turn and return `(response, proactive_items)`."""
+
+        # episodic log: user
+        ep_user = self.memory.add_episode(self.cfg.session_id, "user", user_text, metadata={})
+        _ = self.bus.publish("episode_added", {"episode_id": ep_user, "role": "user"})
+
+        plan: Plan = self.planner.plan(user_text, tools=self.tools, memory=self.memory)
+
+        tool_outcomes: list[ToolOutcome] = []
+        evidence_ids: list[str] = []
+        memory_hits: JsonObject = {"notes": [], "evidence": [], "skills": []}
+
+        # Execute plan
+        for step in plan.steps:
+            if isinstance(step, StepMemorySearch):
+                out = self.tools.execute(
+                    ToolCall(name="memory_search", arguments={"query": step.query, "k": step.k})
+                )
+                tool_outcomes.append(out)
+                if out.evidence_id:
+                    evidence_ids.append(out.evidence_id)
+                if out.ok:
+                    memory_hits = cast(JsonObject, out.output)
+
+            elif isinstance(step, StepToolCall):
+                out = self.tools.execute(ToolCall(name=step.tool, arguments=step.arguments))
+                tool_outcomes.append(out)
+                if out.evidence_id:
+                    evidence_ids.append(out.evidence_id)
+
+            elif isinstance(step, StepWriteNote):
+                nid = self.memory.add_note(
+                    step.title,
+                    step.content,
+                    tags=step.tags,
+                    source_ids=[ep_user],
+                    confidence=step.confidence,
+                )
+                _ = self.bus.publish("note_added", {"note_id": nid})
+                ev = self.memory.add_evidence(
+                    "note_write",
+                    jdump({"note_id": nid, "title": step.title}),
+                    metadata={},
+                )
+                evidence_ids.append(ev)
+
+            elif isinstance(step, StepCreateTask):
+                tid = self.memory.add_task(
+                    step.title,
+                    step.description,
+                    priority=step.priority,
+                    payload=step.payload,
+                )
+                _ = self.bus.publish("task_added", {"task_id": tid})
+                ev = self.memory.add_evidence(
+                    "task_create",
+                    jdump({"task_id": tid, "title": step.title}),
+                    metadata={},
+                )
+                evidence_ids.append(ev)
+
+            else:
+                # StepRespond (or unknown future step types) is handled after the loop.
+                pass
+
+        # Optional self-hydration: if memory search is empty and web_search is
+        # enabled, gather evidence.
+        if self.cfg.auto_research and self.cfg.allow_web_search:
+            had_mem_search = any(o.ok and o.tool == "memory_search" for o in tool_outcomes)
+            had_web_search = any(o.ok and o.tool == "web_search" for o in tool_outcomes)
+            empty_hits = not (
+                memory_hits.get("notes") or memory_hits.get("evidence") or memory_hits.get("skills")
+            )
+            if had_mem_search and empty_hits and (not had_web_search):
+                out = self.tools.execute(
+                    ToolCall(name="web_search", arguments={"query": user_text, "k": 5})
+                )
+                tool_outcomes.append(out)
+                if out.evidence_id:
+                    evidence_ids.append(out.evidence_id)
+
+        # Evidence map for reasoner
+        evidence_map: dict[str, str] = {}
+        for eid in evidence_ids:
+            ev = self.memory.get_evidence(eid)
+            if ev:
+                evidence_map[eid] = ev["content"]
+
+        proposed = self.reasoner.propose(
+            user_text,
+            plan=plan,
+            evidence_map=evidence_map,
+            memory_hits=memory_hits,
+            tool_outcomes=tool_outcomes,
+        )
+        verified = self.verifier.verify(proposed)
+        response = self.renderer.render(verified)
+
+        # Notary: if auto-research ran and we still can't verify, cut the hard-line and escalate.
+        if (
+            self.notary is not None
+            and (not verified.ok)
+            and self.cfg.auto_research
+            and self.cfg.allow_web_search
+            and any(o.tool == "web_search" for o in tool_outcomes)
+        ):
+            _ = self.notary.escalate(
+                user_text=user_text,
+                plan=plan,
+                verified=verified,
+                tool_outcomes=tool_outcomes,
+                reason="abstained after web_search steering",
+            )
+            response = (
+                "I can’t verify any claims from trusted evidence. "
+                "I’ve flagged this for human review and will not proceed further on this thread."
+            )
+
+        # episodic log: assistant
+        ep_bot = self.memory.add_episode(
+            self.cfg.session_id,
+            "assistant",
+            response,
+            metadata={"plan": pyd_compat.model_dump(plan)},
+        )
+        _ = self.bus.publish(
+            "episode_added",
+            {"episode_id": ep_bot, "role": "assistant"},
+        )
+
+        proactive = cast(list[JsonObject], self.initiative.poll(limit=3))
+        return response, proactive
+
+
+
+---
+File: /cogos/cli.py
+---
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import os
+import signal
+import threading
+import traceback
+from pathlib import Path
+from typing import List, Optional
+
+from .agent import AgentConfig, CogOS
+from .model import HFModelSpec, ensure_hf_model
+from .tools import ToolCall
+from .util import short
+
+
+def _install_sigint_handler(stop_flag: threading.Event) -> None:
+    def _h(sig, frame):  # noqa: ARG001
+        stop_flag.set()
+
+    signal.signal(signal.SIGINT, _h)
+    signal.signal(signal.SIGTERM, _h)
+
+
+def cmd_chat(args: argparse.Namespace) -> int:
+    if args.web_allow_domain is None:
+        web_allow_domain = ["wikipedia.org", "arxiv.org", "github.com"]
+    else:
+        web_allow_domain = args.web_allow_domain
+
+    cfg = AgentConfig(
+        db=args.db,
+        session_id=args.session_id,
+        embedder=args.embedder,
+        st_model=args.st_model,
+        llm_backend=args.llm_backend,
+        llama_model=args.llama_model,
+        llama_model_dir=args.llama_model_dir,
+        llama_auto_download=args.llama_auto_download,
+        llama_hf_repo=args.llama_hf_repo,
+        llama_hf_file=args.llama_hf_file,
+        llama_hf_rev=args.llama_hf_rev,
+        llama_ctx=args.llama_ctx,
+        llama_threads=args.llama_threads,
+        llama_gpu_layers=args.llama_gpu_layers,
+        planner=args.planner,
+        reasoner=args.reasoner,
+        search_samples=args.search_samples,
+        allow_side_effects=args.allow_side_effects,
+        allow_web_search=args.allow_web_search,
+        auto_research=args.auto_research,
+        web_allow_domains=tuple(web_allow_domain),
+        web_deny_domains=tuple(args.web_deny_domain or []),
+        min_evidence_trust=args.min_evidence_trust,
+        notary=args.notary,
+        notary_priority=args.notary_priority,
+        read_root=tuple(args.read_root),
+        write_root=tuple(args.write_root),
+        prune_episodes=args.prune_episodes,
+        episode_keep_last=args.episode_keep_last,
+        episode_prune_batch=args.episode_prune_batch,
+        episode_digest_chars=args.episode_digest_chars,
+        episode_digest_confidence=args.episode_digest_confidence,
+        background=not args.no_background,
+        json_logs=args.json_logs,
+        log_level=args.log_level,
+        initiative_threshold=args.initiative_threshold,
+    )
+
+    agent = CogOS(cfg)
+    stop_flag = threading.Event()
+    _install_sigint_handler(stop_flag)
+
+    try:
+        print(
+            f"CogOS production baseline (llm={agent.cfg.llm_backend}, planner={agent.cfg.planner}, reasoner={agent.cfg.reasoner}). "
+            "/help for commands. Ctrl-C or /quit to exit.\n"
+        )
+        while not stop_flag.is_set():
+            try:
+                user = input("you> ").strip()
+            except EOFError:
+                break
+            except KeyboardInterrupt:
+                print()
+                break
+
+            if not user:
+                continue
+            if user in ("/q", "/quit", "/exit"):
+                break
+
+            # --- commands ---
+            if user == "/help":
+                print("Commands:")
+                print("  /tools               list tools")
+                print("  /notes               list recent notes")
+                print("  /skills              list recent skills")
+                print("  /episodes            list recent episodes")
+                print("  /tasks               list tasks")
+                print("  /task add <title>::<desc>   create a task")
+                print("  /poll                show proactive messages")
+                print("  /quit                exit")
+                continue
+
+            if user == "/tools":
+                for t in agent.tools.list_tools():
+                    print(f"- {t['name']} (side_effects={t['side_effects']}): {t['description']}")
+                continue
+
+            if user == "/notes":
+                for n in agent.memory.list_notes(limit=10):
+                    print(
+                        f"- {n['id']}  {short(n['title'], 60)}  tags={n['tags']}  links={len(n['links'])}  conf={n['confidence']:.2f}"
+                    )
+                continue
+
+            if user == "/skills":
+                for s in agent.memory.list_skills(limit=10):
+                    print(f"- {s['id']}  {short(s['name'], 60)}  {s['description']}")
+                continue
+
+            if user == "/episodes":
+                eps = agent.memory.recent_episodes(agent.cfg.session_id, limit=10)
+                for e in reversed(eps):
+                    ts = dt.datetime.fromtimestamp(e["ts"]).isoformat(timespec="seconds")
+                    print(f"[{ts}] {e['role']}: {short(e['content'], 120)}")
+                continue
+
+            if user == "/tasks":
+                tasks = agent.memory.list_tasks(limit=20)
+                for t in tasks:
+                    ts = dt.datetime.fromtimestamp(t["updated"]).isoformat(timespec="seconds")
+                    print(
+                        f"- {t['id']}  [{t['status']}] p={t['priority']} tries={t['attempts']}  {t['title']}  ({ts})"
+                    )
+                    print(f"    {t['description']}")
+                continue
+
+            if user.startswith("/task add "):
+                rest = user[len("/task add ") :].strip()
+                if "::" in rest:
+                    title, desc = rest.split("::", 1)
+                else:
+                    title, desc = rest, ""
+                tid = agent.memory.add_task(
+                    title.strip() or "Untitled task",
+                    desc.strip() or "No description",
+                    priority=1,
+                )
+                print(f"Created task: {tid}")
+                continue
+
+            if user == "/poll":
+                msgs = agent.initiative.poll(limit=5)
+                if not msgs:
+                    print("(no proactive messages)")
+                for m in msgs:
+                    print(f"[initiative score={m['score']:.2f}] {m['message']}")
+                continue
+
+            # --- normal turn ---
+            try:
+                ans, proactive = agent.handle(user)
+            except Exception as e:
+                print(f"bot> ERROR: {e}")
+                traceback.print_exc()
+                continue
+
+            print(f"bot> {ans}")
+            for pm in proactive:
+                print(f"\n[initiative score={pm['score']:.2f}] {pm['message']}\n")
+    finally:
+        agent.close()
+    return 0
+
+
+def cmd_selftest(args: argparse.Namespace) -> int:
+    """
+    Quick sanity checks you can run in CI or after installation.
+
+    This is not a full test suite, but it catches common environment/DB issues:
+    - SQLite write/read
+    - FTS5 availability (if present)
+    - calc tool
+    - hybrid retrieval (vector + lexical fusion)
+    """
+    import tempfile
+
+    # Create an isolated temp DB unless user explicitly supplies one.
+    tmp_path = None
+    db_path = args.db
+    if db_path == ":memory:":
+        db_path = ":memory:"
+    elif not db_path:
+        fd, tmp_path = tempfile.mkstemp(prefix="cogos_selftest_", suffix=".db")
+        os.close(fd)
+        db_path = tmp_path
+
+    cfg = AgentConfig(
+        db=db_path,
+        session_id="selftest",
+        embedder="hash",
+        llm_backend="stub",
+        planner="rule",
+        reasoner="conservative",
+        background=False,
+        log_level="WARNING",
+    )
+
+    agent = CogOS(cfg)
+    try:
+        # Tool: calc
+        out = agent.tools.execute(ToolCall(name="calc", arguments={"expression": "2+2"}))
+        assert out.ok, out.error
+        assert float(out.output.get("result", -1)) == 4.0
+
+        # Memory: add/search notes
+        nid = agent.memory.add_note("Test Note", "hello world", tags=["test"], confidence=0.9)
+        hits = agent.memory.search_notes("hello", k=3)
+        assert any(h.get("id") == nid for h in hits), "note not retrievable"
+
+        # Tool: memory_search
+        ms = agent.tools.execute(ToolCall(name="memory_search", arguments={"query": "hello", "k": 3}))
+        assert ms.ok, ms.error
+        assert isinstance(ms.output.get("notes"), list)
+
+        # End-to-end: handle() should return grounded calc result
+        ans, _ = agent.handle("calculate 10/4")
+        assert "2.5" in ans or "2.50" in ans, ans
+
+        print("Selftest OK ✅")
+        return 0
+    except AssertionError as e:
+        print("Selftest FAILED ❌")
+        print(str(e))
+        return 1
+    finally:
+        agent.close()
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+def cmd_download_model(args: argparse.Namespace) -> int:
+    spec = HFModelSpec(repo_id=args.hf_repo, filename=args.hf_file, revision=args.hf_rev)
+    path = ensure_hf_model(spec, model_dir=Path(args.model_dir).expanduser().resolve())
+    print(str(path))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="cogos_prod", description="CogOS production-grade baseline (split into modules).")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    chat = sub.add_parser("chat", help="Interactive chat loop.")
+    chat.add_argument("--db", default="cogos.db")
+    chat.add_argument("--session-id", default="default")
+
+    chat.add_argument("--embedder", choices=["hash", "st"], default="hash")
+    chat.add_argument("--st-model", default="all-MiniLM-L6-v2")
+
+    chat.add_argument("--llm-backend", choices=["stub", "llama_cpp"], default="stub")
+    chat.add_argument(
+        "--llama-model",
+        default=os.environ.get("COGOS_LLAMA_MODEL", ""),
+        help="Local `.gguf` path or `hf://org/repo/path/to/file.gguf[@rev]`",
+    )
+    chat.add_argument("--llama-model-dir", default=os.environ.get("COGOS_LLAMA_MODEL_DIR", "models"))
+    chat.add_argument("--llama-auto-download", action="store_true", help="Download default model if --llama-model is empty.")
+    chat.add_argument("--llama-hf-repo", default=os.environ.get("COGOS_LLAMA_HF_REPO", "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF"))
+    chat.add_argument("--llama-hf-file", default=os.environ.get("COGOS_LLAMA_HF_FILE", "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"))
+    chat.add_argument("--llama-hf-rev", default=os.environ.get("COGOS_LLAMA_HF_REV", "main"))
+    chat.add_argument("--llama-ctx", type=int, default=int(os.environ.get("COGOS_LLAMA_CTX", "4096")))
+    chat.add_argument("--llama-threads", type=int, default=None)
+    chat.add_argument("--llama-gpu-layers", type=int, default=int(os.environ.get("COGOS_LLAMA_GPU_LAYERS", "0")))
+
+    chat.add_argument("--planner", choices=["rule", "llm"], default="rule")
+    chat.add_argument("--reasoner", choices=["conservative", "llm", "search"], default="conservative")
+    chat.add_argument("--search-samples", type=int, default=4)
+
+    chat.add_argument("--allow-side-effects", action="store_true")
+    chat.add_argument(
+        "--allow-web-search",
+        action="store_true",
+        help="Enable the web_search tool (network). If disabled, CogOS is fully offline/local-first.",
+    )
+    chat.add_argument(
+        "--auto-research",
+        action="store_true",
+        help="If memory_search yields no hits, automatically run web_search once to gather evidence (context firewall).",
+    )
+    chat.add_argument(
+        "--web-allow-domain",
+        action="append",
+        default=None,
+        help="Allowlist domains for web_search (repeatable).",
+    )
+    chat.add_argument(
+        "--web-deny-domain",
+        action="append",
+        default=[],
+        help="Denylist domains for web_search (repeatable).",
+    )
+    chat.add_argument(
+        "--min-evidence-trust",
+        type=float,
+        default=0.0,
+        help="Verifier threshold: reject claims that cite evidence with trust_score below this value (0.0-1.0).",
+    )
+    chat.add_argument(
+        "--notary",
+        action="store_true",
+        help="Enable the Notary: if auto-research steering fails to produce verified claims, escalate for human review.",
+    )
+    chat.add_argument(
+        "--notary-priority",
+        type=int,
+        default=10,
+        help="Priority used for Notary-created human review tasks.",
+    )
+    chat.add_argument("--read-root", action="append", default=["."])
+    chat.add_argument("--write-root", action="append", default=["."])
+
+    chat.add_argument(
+        "--prune-episodes",
+        action="store_true",
+        help="Summarize+delete old episodes into Notes (background daemon).",
+    )
+    chat.add_argument("--episode-keep-last", type=int, default=200)
+    chat.add_argument("--episode-prune-batch", type=int, default=50)
+    chat.add_argument("--episode-digest-chars", type=int, default=280)
+    chat.add_argument("--episode-digest-confidence", type=float, default=0.55)
+
+    chat.add_argument("--initiative-threshold", type=float, default=0.62)
+    chat.add_argument("--no-background", action="store_true")
+
+    chat.add_argument("--log-level", default="INFO")
+    chat.add_argument("--json-logs", action="store_true")
+
+    chat.set_defaults(func=cmd_chat)
+
+    selftest = sub.add_parser("selftest", help="Run quick internal sanity tests.")
+    selftest.add_argument("--db", default="")
+    selftest.set_defaults(func=cmd_selftest)
+
+    dl = sub.add_parser("download-model", help="Download a default GGUF model from Hugging Face.")
+    dl.add_argument("--model-dir", default=os.environ.get("COGOS_LLAMA_MODEL_DIR", "models"))
+    dl.add_argument("--hf-repo", default=os.environ.get("COGOS_LLAMA_HF_REPO", "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF"))
+    dl.add_argument("--hf-file", default=os.environ.get("COGOS_LLAMA_HF_FILE", "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"))
+    dl.add_argument("--hf-rev", default=os.environ.get("COGOS_LLAMA_HF_REV", "main"))
+    dl.set_defaults(func=cmd_download_model)
+    return p
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    return args.func(args)
+
+
+
+---
+File: /cogos/daemons.py
+---
+
+from __future__ import annotations
+
+import datetime as dt
+import threading
+from typing import Any, Dict, List, Optional
+
+from .event_bus import Event, EventBus
+from .initiative import ProactiveCandidate
+from .logging_utils import log
+from .pyd_compat import BaseModel
+from .tools import ToolCall
+from .util import jdump, short, toks, utc_ts
+
+
+class DaemonContext(BaseModel):
+    memory: Any
+    tools: Any
+    initiative: Any
+    bus: Any
+    llm: Optional[Any] = None
+    session_id: str = "default"
+
+
+class Daemon:
+    name: str = "daemon"
+    tick_every_s: float = 5.0
+
+    def on_event(self, evt: Event, ctx: DaemonContext) -> None:
+        return
+
+    def tick(self, ctx: DaemonContext) -> None:
+        return
+
+
+class ReflectionDaemon(Daemon):
+    name = "reflection"
+    tick_every_s = 2.0
+
+    def on_event(self, evt: Event, ctx: DaemonContext) -> None:
+        if evt.type != "episode_added":
+            return
+        if evt.payload.get("role") != "assistant":
+            return
+        # Lightweight reflection: store last interaction as a note
+        eps = ctx.memory.recent_episodes(ctx.session_id, limit=6)
+        last_user = next((e for e in eps if e["role"] == "user"), None)
+        last_bot = next((e for e in eps if e["role"] == "assistant"), None)
+        if not last_user or not last_bot:
+            return
+        title = "Conversation fragment"
+        content = f"User: {short(last_user['content'], 900)}\nAssistant: {short(last_bot['content'], 900)}"
+        nid = ctx.memory.add_note(
+            title,
+            content,
+            tags=["conversation"],
+            source_ids=[last_user["id"], last_bot["id"]],
+            confidence=0.6,
+        )
+        ctx.bus.publish("note_added", {"note_id": nid})
+
+
+class PruningDaemon(Daemon):
+    """
+    Summarize old episodes into an extractive Note and delete the raw episodes.
+
+    This keeps the episodes table bounded while preserving a searchable digest
+    in Notes (which already participate in hybrid retrieval).
+    """
+
+    name = "pruning"
+    tick_every_s = 30.0
+
+    def __init__(
+        self,
+        *,
+        keep_last: int = 200,
+        batch: int = 50,
+        digest_chars: int = 280,
+        confidence: float = 0.55,
+    ):
+        self.keep_last = max(0, int(keep_last))
+        self.batch = max(1, int(batch))
+        self.digest_chars = max(40, int(digest_chars))
+        self.confidence = float(confidence)
+
+    def tick(self, ctx: DaemonContext) -> None:
+        total = int(ctx.memory.count_episodes(ctx.session_id))
+        if total <= self.keep_last:
+            return
+
+        n = min(self.batch, total - self.keep_last)
+        eps = ctx.memory.oldest_episodes(ctx.session_id, limit=n)
+        if not eps:
+            return
+
+        start_iso = dt.datetime.fromtimestamp(float(eps[0]["ts"])).isoformat(timespec="seconds")
+        end_iso = dt.datetime.fromtimestamp(float(eps[-1]["ts"])).isoformat(timespec="seconds")
+
+        title = f"Episode digest ({ctx.session_id}) {end_iso}"
+        lines: List[str] = [
+            f"session_id: {ctx.session_id}",
+            f"created: {dt.datetime.now().isoformat(timespec='seconds')}",
+            f"episodes: {len(eps)} (keeping last {self.keep_last})",
+            f"range: {start_iso} .. {end_iso}",
+            "",
+            "Extractive digest (verbatim snippets):",
+        ]
+        for e in eps:
+            lines.append(f"- {e['id']} {e['role']}: {short(e['content'], self.digest_chars)}")
+
+        nid = ctx.memory.add_note(
+            title,
+            "\n".join(lines),
+            tags=["episode_digest"],
+            source_ids=[e["id"] for e in eps],
+            confidence=self.confidence,
+        )
+        ctx.bus.publish("note_added", {"note_id": nid})
+
+        deleted = ctx.memory.delete_episodes([e["id"] for e in eps])
+        evid = ctx.memory.add_evidence(
+            "episodes_pruned",
+            jdump({"note_id": nid, "deleted": deleted, "session_id": ctx.session_id, "range": [start_iso, end_iso]}),
+            metadata={"note_id": nid, "session_id": ctx.session_id},
+            dedupe=False,
+        )
+        ctx.bus.publish("episodes_pruned", {"note_id": nid, "deleted": deleted, "evidence_id": evid})
+
+        ctx.initiative.submit(
+            ProactiveCandidate(
+                message=f"Pruned {deleted} old episode(s) into note {nid}.",
+                evidence_ids=[evid],
+                expected_utility=0.6,
+                confidence=0.7,
+                actionability=0.5,
+                interruption_cost=0.25,
+                risk=0.15,
+            )
+        )
+
+
+class ConnectionMiner(Daemon):
+    name = "connection_miner"
+    tick_every_s = 5.0
+
+    def __init__(self, min_score: float = 0.055):
+        # RRF score values are small; threshold accordingly.
+        self.min_score = float(min_score)
+
+    def on_event(self, evt: Event, ctx: DaemonContext) -> None:
+        if evt.type != "note_added":
+            return
+        nid = evt.payload.get("note_id")
+        if not nid:
+            return
+        n = ctx.memory.get_note(nid)
+        if not n:
+            return
+        hits = ctx.memory.search_notes(n["title"] + "\n" + n["content"], k=6)
+        for h in hits:
+            hid = h.get("id")
+            if not hid or hid == nid:
+                continue
+            score = float(h.get("score", 0.0))
+            if score >= self.min_score:
+                ctx.memory.link_notes(nid, hid, "related", score)
+                ctx.initiative.submit(
+                    ProactiveCandidate(
+                        message=f"New connection: note {nid} looks related to {hid} (rrf≈{score:.3f}).",
+                        expected_utility=0.55,
+                        confidence=0.6,
+                        actionability=0.35,
+                        interruption_cost=0.25,
+                        risk=0.1,
+                    )
+                )
+
+
+class ConsistencyAuditor(Daemon):
+    name = "consistency_auditor"
+    tick_every_s = 20.0
+
+    def tick(self, ctx: DaemonContext) -> None:
+        notes = ctx.memory.list_notes(limit=200)
+        by_title: Dict[str, List[Dict[str, Any]]] = {}
+        for n in notes:
+            by_title.setdefault(n["title"].strip().lower(), []).append(n)
+        for t, group in by_title.items():
+            if len(group) < 2:
+                continue
+            # Heuristic: if multiple notes share a title, ensure they aren't wildly dissimilar.
+            base = ctx.memory.get_note(group[0]["id"])
+            if not base:
+                continue
+            base_toks = set(toks(base["content"]))
+            for g in group[1:]:
+                other = ctx.memory.get_note(g["id"])
+                if not other:
+                    continue
+                ot = set(toks(other["content"]))
+                j = len(base_toks & ot) / (len(base_toks | ot) or 1)
+                if j < 0.15:
+                    ctx.initiative.submit(
+                        ProactiveCandidate(
+                            message=f"Potential inconsistency: notes titled '{t}' differ a lot (overlap≈{j:.2f}).",
+                            expected_utility=0.6,
+                            confidence=0.45,
+                            actionability=0.25,
+                            interruption_cost=0.35,
+                            risk=0.25,
+                        )
+                    )
+                    return
+
+
+class TaskSolverDaemon(Daemon):
+    """
+    Background worker that tries to solve queued tasks using memory/tools.
+    In production you'd tailor this to your domain and add more tools.
+    """
+
+    name = "task_solver"
+    tick_every_s = 3.0
+
+    def __init__(self, max_steps: int = 4):
+        self.max_steps = int(max_steps)
+
+    def tick(self, ctx: DaemonContext) -> None:
+        task = ctx.memory.fetch_runnable_task()
+        if not task:
+            return
+        tid = task["id"]
+        title = task["title"]
+        desc = task["description"]
+
+        # Attempt 1: retrieve related memories
+        out = ctx.tools.execute(ToolCall(name="memory_search", arguments={"query": f"{title}\n{desc}", "k": 6}))
+        evidence_ids: List[str] = []
+        if out.ok and out.evidence_id:
+            evidence_ids.append(out.evidence_id)
+
+        if out.ok:
+            notes = out.output.get("notes") or []
+            if notes:
+                # Mark done with summary of retrieved notes
+                result = {"summary": "Found related notes", "notes": notes[:3]}
+                ctx.memory.complete_task(tid, status="done", result=result, evidence_ids=evidence_ids)
+                ctx.initiative.submit(
+                    ProactiveCandidate(
+                        message=f"Task '{title}' resolved via memory: found {len(notes)} related note(s).",
+                        evidence_ids=evidence_ids,
+                        expected_utility=0.7,
+                        confidence=0.7,
+                        actionability=0.6,
+                        interruption_cost=0.2,
+                        risk=0.1,
+                    )
+                )
+                return
+
+        # If no useful info, block and retry later
+        ctx.memory.complete_task(
+            tid,
+            status="blocked",
+            result={"summary": "Insufficient memory. Needs more info/tools."},
+            evidence_ids=evidence_ids,
+            next_run_ts=utc_ts() + 120.0,
+        )
+
+
+class BackgroundRunner:
+    def __init__(self, bus: EventBus, ctx: DaemonContext, daemons: List[Daemon]):
+        self.bus = bus
+        self.ctx = ctx
+        self.daemons = daemons
+        self._stop = threading.Event()
+        self._th = threading.Thread(target=self._run, name="cogos-bg", daemon=True)
+        self._last_tick: Dict[str, float] = {d.name: 0.0 for d in daemons}
+
+    def start(self) -> None:
+        self._th.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._th.join(timeout=2.0)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            evt = self.bus.get(timeout=0.2)
+            if evt:
+                for d in self.daemons:
+                    try:
+                        d.on_event(evt, self.ctx)
+                    except Exception as e:
+                        log.warning(
+                            "daemon.on_event failed (daemon=%s): %s",
+                            d.name,
+                            e,
+                            exc_info=True,
+                            extra={"extra": {"daemon": d.name, "err": str(e)}},
+                        )
+            now = utc_ts()
+            for d in self.daemons:
+                if now - self._last_tick.get(d.name, 0.0) >= d.tick_every_s:
+                    self._last_tick[d.name] = now
+                    try:
+                        d.tick(self.ctx)
+                    except Exception as e:
+                        log.warning(
+                            "daemon.tick failed (daemon=%s): %s",
+                            d.name,
+                            e,
+                            exc_info=True,
+                            extra={"extra": {"daemon": d.name, "err": str(e)}},
+                        )
+
+
+
+---
+File: /cogos/embeddings.py
+---
+
+from __future__ import annotations
+
+import hashlib
+from typing import TYPE_CHECKING
+
+from .np_compat import np
+from .util import toks
+
+if TYPE_CHECKING:  # pragma: no cover
+    import numpy as _np
+
+
+class EmbeddingModel:
+    dim: int
+    name: str = "base"
+
+    def embed(self, text: str) -> "_np.ndarray":
+        raise NotImplementedError
+
+
+class HashEmbed(EmbeddingModel):
+    """Fast, dependency-free, decent baseline embedding via feature hashing."""
+
+    name = "hash"
+
+    def __init__(self, dim: int = 384):
+        if np is None:
+            raise RuntimeError("numpy is required for embeddings. pip install numpy")
+        self.dim = int(dim)
+
+    def _h64(self, token: str) -> int:
+        h = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
+        return int.from_bytes(h, "little", signed=False)
+
+    def embed(self, text: str) -> "_np.ndarray":
+        v = np.zeros((self.dim,), dtype=np.float32)
+        ts = toks(text)
+        if not ts:
+            return v
+        for t in ts:
+            hv = self._h64(t)
+            idx = hv % self.dim
+            sign = 1.0 if ((hv >> 63) & 1) == 0 else -1.0
+            v[idx] += sign
+        n = float(np.linalg.norm(v))
+        if n > 0:
+            v /= n
+        return v
+
+
+class SentenceTransformerEmbed(EmbeddingModel):
+    name = "sentence_transformers"
+
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+        if np is None:
+            raise RuntimeError("numpy is required for embeddings. pip install numpy")
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore
+        except Exception as e:
+            raise ImportError("sentence-transformers not installed. pip install sentence-transformers") from e
+        self._st = SentenceTransformer(model_name)
+        self.dim = int(self._st.get_sentence_embedding_dimension())
+
+    def embed(self, text: str) -> "_np.ndarray":
+        v = self._st.encode([text], normalize_embeddings=True)[0]
+        return np.asarray(v, dtype=np.float32)
+
+
+def cosine(a: "_np.ndarray", b: "_np.ndarray") -> float:
+    if np is None:
+        return 0.0
+    da = float(np.linalg.norm(a))
+    db = float(np.linalg.norm(b))
+    if da == 0.0 or db == 0.0:
+        return 0.0
+    return float(np.dot(a, b) / (da * db))
+
+
+
+
+---
+File: /cogos/event_bus.py
+---
+
+from __future__ import annotations
+
+import dataclasses
+import queue
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
+
+from .util import new_id, utc_ts
+
+
+@dataclass(frozen=True)
+class Event:
+    type: str
+    ts: float
+    payload: Dict[str, Any]
+    id: str = dataclasses.field(default_factory=lambda: new_id("evt"))
+
+
+class EventBus:
+    """Thread-safe pub/sub queue."""
+
+    def __init__(self):
+        self._q: "queue.Queue[Event]" = queue.Queue()
+
+    def publish(self, type: str, payload: Dict[str, Any]) -> Event:
+        evt = Event(type=type, ts=utc_ts(), payload=payload)
+        self._q.put(evt)
+        return evt
+
+    def get(self, timeout: Optional[float] = None) -> Optional[Event]:
+        try:
+            return self._q.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+
+
+
+---
+File: /cogos/initiative.py
+---
+
+from __future__ import annotations
+
+import threading
+from typing import Any, Dict, List, Optional
+
+from .memory import MemoryStore
+from .pyd_compat import BaseModel, Field
+from .util import clamp, utc_ts
+
+
+class ProactiveCandidate(BaseModel):
+    message: str
+    evidence_ids: List[str] = Field(default_factory=list)
+    expected_utility: float = 0.5
+    confidence: float = 0.5
+    actionability: float = 0.5
+    interruption_cost: float = 0.3
+    risk: float = 0.2
+
+
+class InitiativeManager:
+    def __init__(
+        self,
+        memory: MemoryStore,
+        *,
+        threshold: float = 0.62,
+        cooldown_s: float = 15.0,
+        max_per_hour: int = 10,
+    ):
+        self.memory = memory
+        self.threshold = float(threshold)
+        self.cooldown_s = float(cooldown_s)
+        self.max_per_hour = int(max_per_hour)
+        self._lock = threading.Lock()
+        self._last_emit = 0.0
+        self._recent: List[float] = []
+
+    def _score(self, c: ProactiveCandidate) -> float:
+        impulse = (c.expected_utility * c.confidence * c.actionability) - (c.interruption_cost + c.risk)
+        return clamp(0.5 + impulse, 0.0, 1.0)
+
+    def submit(self, c: ProactiveCandidate) -> Optional[str]:
+        score = self._score(c)
+        now = utc_ts()
+        with self._lock:
+            # cooldown
+            if now - self._last_emit < self.cooldown_s:
+                return None
+            # rate limit
+            cutoff = now - 3600.0
+            self._recent = [t for t in self._recent if t >= cutoff]
+            if len(self._recent) >= self.max_per_hour:
+                return None
+
+            if score >= self.threshold:
+                pid = self.memory.add_proactive(c.message, score=score, evidence_ids=c.evidence_ids)
+                self._last_emit = now
+                self._recent.append(now)
+                return pid
+        return None
+
+    def poll(self, limit: int = 3) -> List[Dict[str, Any]]:
+        return self.memory.fetch_undelivered_proactive(limit=limit)
+
+
+
+
+---
+File: /cogos/ir.py
+---
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Literal, Union
+
+from .pyd_compat import BaseModel, Field
+from .util import new_id
+
+
+class StepBase(BaseModel):
+    type: str
+
+
+class StepMemorySearch(StepBase):
+    type: Literal["memory_search"] = "memory_search"
+    query: str
+    k: int = 5
+
+
+class StepToolCall(StepBase):
+    type: Literal["tool_call"] = "tool_call"
+    tool: str
+    arguments: Dict[str, Any] = Field(default_factory=dict)
+
+
+class StepWriteNote(StepBase):
+    type: Literal["write_note"] = "write_note"
+    title: str
+    content: str
+    tags: List[str] = Field(default_factory=list)
+    confidence: float = 0.7
+
+
+class StepCreateTask(StepBase):
+    type: Literal["create_task"] = "create_task"
+    title: str
+    description: str
+    priority: int = 0
+    payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+class StepRespond(StepBase):
+    type: Literal["respond"] = "respond"
+    style: str = "helpful"
+
+
+PlanStep = Union[StepMemorySearch, StepToolCall, StepWriteNote, StepCreateTask, StepRespond]
+
+
+class Plan(BaseModel):
+    steps: List[PlanStep] = Field(default_factory=list)
+
+
+class Claim(BaseModel):
+    id: str = Field(default_factory=lambda: new_id("clm"))
+    text: str
+    evidence_ids: List[str] = Field(default_factory=list)
+    support_spans: List[str] = Field(default_factory=list)  # exact quotes expected to appear in evidence
+    kind: Literal["fact", "math", "inference"] = "fact"
+    status: Literal["proposed", "verified", "rejected"] = "proposed"
+    score: float = 0.5
+
+
+class ProposedAnswer(BaseModel):
+    claims: List[Claim] = Field(default_factory=list)
+    draft: str = ""
+    proactive: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class VerifiedAnswer(BaseModel):
+    ok: bool
+    claims: List[Claim] = Field(default_factory=list)
+    response: str = ""
+    warnings: List[str] = Field(default_factory=list)
+
+
+
+
+---
+File: /cogos/llm.py
+---
+
+from __future__ import annotations
+
+import inspect
+import json
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, TypeVar, cast
+
+from .pyd_compat import BaseModel, _model_json_schema
+from .util import extract_first_json_object, short
+
+
+_TModel = TypeVar("_TModel", bound=BaseModel)
+
+
+_JSON_OBJECT_GBNF = r"""
+root ::= object
+
+value ::= object | array | string | number | ("true" | "false" | "null") ws
+
+object ::= "{" ws ( string ":" ws value ("," ws string ":" ws value)* )? "}" ws
+array ::= "[" ws ( value ("," ws value)* )? "]" ws
+
+string ::= "\"" ( [^"\\] | "\\" ( ["\\/bfnrt] | "u" [0-9a-fA-F]{4} ) )* "\"" ws
+number ::= "-"? ("0" | [1-9] [0-9]* ) ( "." [0-9]+ )? ( [eE] [+-]? [0-9]+ )? ws
+
+ws ::= [ \t\n\r]*
+"""
+
+_PLAN_GBNF = r"""
+root ::= plan
+
+plan ::= "{" ws "\"steps\"" ws ":" ws steps ws "}" ws
+steps ::= "[" ws (headsteps ws "," ws)? respondstep ws "]" ws
+
+headsteps ::= headstep (ws "," ws headstep)*
+headstep ::= memorysearchstep | toolcallstep | writenotestep | createtaskstep
+
+respondstep ::= "{" ws "\"type\"" ws ":" ws "\"respond\"" ws "," ws "\"style\"" ws ":" ws string "}" ws
+
+memorysearchstep ::= "{" ws "\"type\"" ws ":" ws "\"memory_search\"" ws "," ws "\"query\"" ws ":" ws string ws "," ws "\"k\"" ws ":" ws int "}" ws
+toolcallstep ::= "{" ws "\"type\"" ws ":" ws "\"tool_call\"" ws "," ws "\"tool\"" ws ":" ws string ws "," ws "\"arguments\"" ws ":" ws object "}" ws
+writenotestep ::= "{" ws "\"type\"" ws ":" ws "\"write_note\"" ws "," ws "\"title\"" ws ":" ws string ws "," ws "\"content\"" ws ":" ws string ws "," ws "\"tags\"" ws ":" ws stringarray ws "," ws "\"confidence\"" ws ":" ws number "}" ws
+createtaskstep ::= "{" ws "\"type\"" ws ":" ws "\"create_task\"" ws "," ws "\"title\"" ws ":" ws string ws "," ws "\"description\"" ws ":" ws string ws "," ws "\"priority\"" ws ":" ws int ws "," ws "\"payload\"" ws ":" ws object "}" ws
+
+value ::= object | array | string | number | ("true" | "false" | "null") ws
+
+object ::= "{" ws ( member (ws "," ws member)* )? "}" ws
+member ::= string ":" ws value
+
+array ::= "[" ws ( value (ws "," ws value)* )? "]" ws
+stringarray ::= "[" ws ( string (ws "," ws string)* )? "]" ws
+
+string ::= "\"" ( [^"\\] | "\\" ( ["\\/bfnrt] | "u" [0-9a-fA-F]{4} ) )* "\"" ws
+number ::= "-"? ("0" | [1-9] [0-9]* ) ( "." [0-9]+ )? ( [eE] [+-]? [0-9]+ )? ws
+int ::= "-"? ("0" | [1-9] [0-9]* ) ws
+
+ws ::= [ \t\n\r]*
+"""
+
+_PLAN_GBNF_DYNAMIC_TOOLS = r"""
+root ::= plan
+
+plan ::= "{" ws "\"steps\"" ws ":" ws steps ws "}" ws
+steps ::= "[" ws (headsteps ws "," ws)? respondstep ws "]" ws
+
+headsteps ::= headstep (ws "," ws headstep)*
+headstep ::= memorysearchstep | toolcallstep | writenotestep | createtaskstep
+
+respondstep ::= "{" ws "\"type\"" ws ":" ws "\"respond\"" ws "," ws "\"style\"" ws ":" ws string "}" ws
+
+memorysearchstep ::= "{" ws "\"type\"" ws ":" ws "\"memory_search\"" ws "," ws "\"query\"" ws ":" ws string ws "," ws "\"k\"" ws ":" ws int "}" ws
+toolcallstep ::= "{" ws "\"type\"" ws ":" ws "\"tool_call\"" ws "," ws "\"tool\"" ws ":" ws toolname ws "," ws "\"arguments\"" ws ":" ws object "}" ws
+writenotestep ::= "{" ws "\"type\"" ws ":" ws "\"write_note\"" ws "," ws "\"title\"" ws ":" ws string ws "," ws "\"content\"" ws ":" ws string ws "," ws "\"tags\"" ws ":" ws stringarray ws "," ws "\"confidence\"" ws ":" ws number "}" ws
+createtaskstep ::= "{" ws "\"type\"" ws ":" ws "\"create_task\"" ws "," ws "\"title\"" ws ":" ws string ws "," ws "\"description\"" ws ":" ws string ws "," ws "\"priority\"" ws ":" ws int ws "," ws "\"payload\"" ws ":" ws object "}" ws
+
+__TOOLNAME_RULE__
+
+value ::= object | array | string | number | ("true" | "false" | "null") ws
+
+object ::= "{" ws ( member (ws "," ws member)* )? "}" ws
+member ::= string ":" ws value
+
+array ::= "[" ws ( value (ws "," ws value)* )? "]" ws
+stringarray ::= "[" ws ( string (ws "," ws string)* )? "]" ws
+
+string ::= "\"" ( [^"\\] | "\\" ( ["\\/bfnrt] | "u" [0-9a-fA-F]{4} ) )* "\"" ws
+number ::= "-"? ("0" | [1-9] [0-9]* ) ( "." [0-9]+ )? ( [eE] [+-]? [0-9]+ )? ws
+int ::= "-"? ("0" | [1-9] [0-9]* ) ws
+
+ws ::= [ \t\n\r]*
+"""
+
+
+def _gbnf_literal_for_json_string(s: str) -> str:
+    """
+    Return a GBNF literal that matches the exact JSON string encoding of `s`.
+
+    Example: s="calc" -> "\"calc\""
+    """
+    js = json.dumps(str(s), ensure_ascii=False)
+    escaped = js.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def build_plan_gbnf(tool_names: Sequence[str]) -> str:
+    """
+    Build a plan grammar that constrains tool names to the provided set.
+    Falls back to the static grammar if tool_names is empty.
+    """
+    names = sorted({str(n).strip() for n in tool_names if str(n).strip()})
+    if not names:
+        return _PLAN_GBNF
+    alts = " | ".join(_gbnf_literal_for_json_string(n) for n in names)
+    tool_rule = f"toolname ::= ( {alts} ) ws"
+    return _PLAN_GBNF_DYNAMIC_TOOLS.replace("__TOOLNAME_RULE__", tool_rule)
+
+
+_REASONER_GBNF = r"""
+root ::= answer
+
+answer ::= "{" ws "\"claims\"" ws ":" ws claims ws "," ws "\"draft\"" ws ":" ws string ws "," ws "\"proactive\"" ws ":" ws objectarray ws "}" ws
+
+claims ::= "[" ws "]" ws
+       | "[" ws claim ws "]" ws
+       | "[" ws claim ws "," ws claim ws "]" ws
+       | "[" ws claim ws "," ws claim ws "," ws claim ws "]" ws
+
+claim ::= "{" ws "\"text\"" ws ":" ws string ws "," ws "\"evidence_ids\"" ws ":" ws evidlist ws "," ws "\"support_span_ids\"" ws ":" ws spanidlist ws "," ws "\"kind\"" ws ":" ws kind "}" ws
+
+evidlist ::= "[" ws string ws "]" ws
+spanidlist ::= "[" ws int ws "]" ws
+           | "[" ws int ws "," ws int ws "]" ws
+
+kind ::= "\"fact\"" ws | "\"math\"" ws | "\"inference\"" ws
+
+value ::= object | array | string | number | ("true" | "false" | "null") ws
+
+object ::= "{" ws ( member (ws "," ws member)* )? "}" ws
+member ::= string ":" ws value
+
+array ::= "[" ws ( value (ws "," ws value)* )? "]" ws
+objectarray ::= "[" ws "]" ws
+            | "[" ws object ws "]" ws
+            | "[" ws object ws "," ws object ws "]" ws
+stringarray ::= "[" ws ( string (ws "," ws string)* )? "]" ws
+
+string ::= "\"" ( [^"\\] | "\\" ( ["\\/bfnrt] | "u" [0-9a-fA-F]{4} ) )* "\"" ws
+number ::= "-"? ("0" | [1-9] [0-9]* ) ( "." [0-9]+ )? ( [eE] [+-]? [0-9]+ )? ws
+int ::= "-"? ("0" | [1-9] [0-9]* ) ws
+
+ws ::= [ \t\n\r]*
+"""
+
+
+class ChatMessage(BaseModel):
+    role: Literal["system", "user", "assistant"]
+    content: str
+
+
+class ChatModel:
+    def generate_text(self, messages: List[ChatMessage], *, temperature: float = 0.2, max_tokens: int = 800) -> str:
+        raise NotImplementedError
+
+    def generate_json(
+        self,
+        messages: List[ChatMessage],
+        schema: type[_TModel],
+        *,
+        temperature: float = 0.2,
+        max_tokens: int = 1200,
+    ) -> _TModel:
+        txt = self.generate_text(messages, temperature=temperature, max_tokens=max_tokens)
+        data = extract_first_json_object(txt)
+        return cast(_TModel, schema(**data))
+
+
+class StubChatModel(ChatModel):
+    def generate_text(self, messages: List[ChatMessage], *, temperature: float = 0.0, max_tokens: int = 256) -> str:
+        # Always abstain; forces grounded/tool-only behavior.
+        return json.dumps({"claims": [], "draft": "I don't know.", "proactive": []})
+
+
+class LlamaCppChatModel(ChatModel):
+    def __init__(
+        self, model_path: str, *, n_ctx: int = 4096, n_threads: Optional[int] = None, n_gpu_layers: int = 0
+    ):
+        try:
+            from llama_cpp import Llama  # type: ignore
+        except Exception as e:
+            raise ImportError("llama-cpp-python not installed. pip install llama-cpp-python") from e
+        try:
+            from llama_cpp import LlamaGrammar  # type: ignore
+        except Exception:
+            LlamaGrammar = None  # type: ignore[assignment]
+        self._llm = Llama(
+            model_path=model_path,
+            n_ctx=int(n_ctx),
+            n_threads=n_threads,
+            n_gpu_layers=int(n_gpu_layers),
+        )
+        self._grammar_cls = LlamaGrammar
+        self._plan_tool_names: Optional[List[str]] = None
+
+    def set_plan_tool_names(self, tool_names: Sequence[str]) -> None:
+        """
+        Configure the set of tool names that the Plan grammar will allow.
+
+        If unset/empty, the planner grammar allows any string tool name.
+        """
+        names = sorted({str(n).strip() for n in tool_names if str(n).strip()})
+        self._plan_tool_names = names if names else None
+
+    @staticmethod
+    def _to_chat_messages(messages: List[ChatMessage]) -> List[Dict[str, str]]:
+        return [{"role": m.role, "content": m.content} for m in messages]
+
+    @staticmethod
+    def _extract_completion_text(resp: Dict[str, Any]) -> str:
+        choices = resp.get("choices") or []
+        if not choices:
+            raise ValueError(f"llama_cpp returned no choices: {list(resp.keys())}")
+        c0 = choices[0] or {}
+        if isinstance(c0, dict):
+            msg = c0.get("message")
+            if isinstance(msg, dict) and "content" in msg:
+                content = msg.get("content")
+                if isinstance(content, (dict, list)):
+                    return json.dumps(content, ensure_ascii=False)
+                return str(content or "").strip()
+            if "text" in c0:
+                text = c0.get("text")
+                if isinstance(text, (dict, list)):
+                    return json.dumps(text, ensure_ascii=False)
+                return str(text or "").strip()
+        return str(c0).strip()
+
+    def _chat_complete(self, messages: List[ChatMessage], *, temperature: float, max_tokens: int, extra: Dict[str, Any]) -> str:
+        if not hasattr(self._llm, "create_chat_completion"):
+            raise AttributeError("llama_cpp.Llama.create_chat_completion is not available in this install")
+        fn: Callable[..., Any] = getattr(self._llm, "create_chat_completion")
+        sig = inspect.signature(fn)
+
+        kwargs: Dict[str, Any] = {"messages": self._to_chat_messages(messages)}
+        if "temperature" in sig.parameters:
+            kwargs["temperature"] = float(temperature)
+        if "max_tokens" in sig.parameters:
+            kwargs["max_tokens"] = int(max_tokens)
+
+        accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        if accepts_kwargs:
+            kwargs.update(extra)
+        else:
+            unknown = [k for k in extra.keys() if k not in sig.parameters]
+            if unknown:
+                raise TypeError(f"create_chat_completion does not accept: {unknown}")
+            kwargs.update(extra)
+
+        resp = fn(**kwargs)
+        if not isinstance(resp, dict):
+            raise TypeError(f"llama_cpp chat completion returned {type(resp).__name__}, expected dict")
+        return self._extract_completion_text(resp)
+
+    def _build_grammar_for_schema(self, schema: type[BaseModel]) -> Any:
+        if self._grammar_cls is None:
+            return None
+        if schema.__module__ == "cogos.ir" and schema.__name__ == "Plan" and hasattr(self._grammar_cls, "from_string"):
+            gbnf = build_plan_gbnf(self._plan_tool_names or [])
+            return self._grammar_cls.from_string(gbnf)  # type: ignore[no-any-return]
+        if (
+            schema.__module__ == "cogos.reasoner"
+            and schema.__qualname__.endswith("LLMReasoner._Schema")
+            and hasattr(self._grammar_cls, "from_string")
+        ):
+            return self._grammar_cls.from_string(_REASONER_GBNF)  # type: ignore[no-any-return]
+        if hasattr(self._grammar_cls, "from_json_schema"):
+            try:
+                schema_json = json.dumps(_model_json_schema(schema))
+                return self._grammar_cls.from_json_schema(schema_json)  # type: ignore[no-any-return]
+            except Exception:
+                pass
+        if hasattr(self._grammar_cls, "from_string"):
+            return self._grammar_cls.from_string(_JSON_OBJECT_GBNF)  # type: ignore[no-any-return]
+        return None
+
+    def generate_text(self, messages: List[ChatMessage], *, temperature: float = 0.2, max_tokens: int = 800) -> str:
+        if hasattr(self._llm, "create_chat_completion"):
+            return self._chat_complete(messages, temperature=temperature, max_tokens=max_tokens, extra={})
+
+        # Fallback for older llama-cpp-python installs: raw completion with a basic transcript.
+        parts: List[str] = []
+        for m in messages:
+            parts.append(f"{m.role.upper()}: {m.content}")
+        parts.append("ASSISTANT:")
+        prompt = "\n".join(parts)
+        out = self._llm(prompt, max_tokens=int(max_tokens), temperature=float(temperature), stop=["USER:", "SYSTEM:"])
+        if not isinstance(out, dict):
+            raise TypeError(f"llama_cpp completion returned {type(out).__name__}, expected dict")
+        return self._extract_completion_text(out)
+
+    def generate_json(
+        self,
+        messages: List[ChatMessage],
+        schema: type[_TModel],
+        *,
+        temperature: float = 0.2,
+        max_tokens: int = 1200,
+    ) -> _TModel:
+        grammar = self._build_grammar_for_schema(schema)
+
+        txt: str
+        if hasattr(self._llm, "create_chat_completion"):
+            # Prefer schema-constrained decoding (via grammar) when available.
+            if grammar is not None:
+                try:
+                    txt = self._chat_complete(
+                        messages, temperature=temperature, max_tokens=max_tokens, extra={"grammar": grammar}
+                    )
+                except TypeError:
+                    # Some llama-cpp-python versions don't plumb grammar through chat completions; fall back explicitly.
+                    fallback_parts: List[str] = []
+                    for m in messages:
+                        fallback_parts.append(f"{m.role.upper()}: {m.content}")
+                    fallback_parts.append("ASSISTANT:")
+                    prompt = "\n".join(fallback_parts)
+                    out = self._llm(
+                        prompt,
+                        max_tokens=int(max_tokens),
+                        temperature=float(temperature),
+                        grammar=grammar,
+                        stop=["USER:", "SYSTEM:"],
+                    )
+                    if not isinstance(out, dict):
+                        raise TypeError(f"llama_cpp completion returned {type(out).__name__}, expected dict")
+                    txt = self._extract_completion_text(out)
+            else:
+                # If grammar isn't available, require explicit JSON support.
+                fn = getattr(self._llm, "create_chat_completion")
+                sig = inspect.signature(fn)
+                accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+                if ("response_format" not in sig.parameters) and (not accepts_kwargs):
+                    raise RuntimeError(
+                        "llama-cpp-python does not expose JSON constrained decoding (missing LlamaGrammar and response_format). "
+                        "Upgrade llama-cpp-python to use --planner llm/--reasoner llm safely."
+                    )
+                txt = self._chat_complete(
+                    messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    extra={"response_format": {"type": "json_object"}},
+                )
+        else:
+            if grammar is None:
+                raise RuntimeError(
+                    "llama-cpp-python install is missing create_chat_completion and grammar support; cannot safely request JSON."
+                )
+            parts: List[str] = []
+            for m in messages:
+                parts.append(f"{m.role.upper()}: {m.content}")
+            parts.append("ASSISTANT:")
+            prompt = "\n".join(parts)
+            out = self._llm(prompt, max_tokens=int(max_tokens), temperature=float(temperature), grammar=grammar, stop=["USER:", "SYSTEM:"])
+            if not isinstance(out, dict):
+                raise TypeError(f"llama_cpp completion returned {type(out).__name__}, expected dict")
+            txt = self._extract_completion_text(out)
+
+        try:
+            data = extract_first_json_object(txt)
+        except Exception as e:
+            raise ValueError(f"Failed to parse JSON from model output: {short(txt, 600)}") from e
+        return cast(_TModel, schema(**data))
+
+
+
+---
+File: /cogos/logging_utils.py
+---
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+import logging
+from typing import cast
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, object] = {
+            "ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds"),
+            "level": record.levelname,
+            "name": record.name,
+            "msg": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+        extra = record.__dict__.get("extra")
+        if isinstance(extra, dict):
+            payload.update(cast(dict[str, object], extra))
+        return json.dumps(payload, ensure_ascii=False)
+
+
+def setup_logging(level: str = "INFO", json_logs: bool = False) -> None:
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, level.upper(), logging.INFO))
+    handler = logging.StreamHandler()
+    handler.setLevel(root.level)
+    handler.setFormatter(
+        JsonFormatter() if json_logs else logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    root.handlers[:] = [handler]
+
+
+log = logging.getLogger("cogos")
+
+
+
+
+---
+File: /cogos/memory.py
+---
+
+from __future__ import annotations
+
+import hashlib
+import sqlite3
+import threading
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from .embeddings import EmbeddingModel
+from .logging_utils import log
+from .np_compat import np
+from .util import jdump, jload, new_id, short, toks, utc_ts
+
+
+class MemoryStore:
+    """
+    Production-oriented SQLite store:
+    - WAL mode, safe transaction boundaries
+    - FTS5 tables for lexical search
+    - Embeddings stored as BLOB for vector search
+    - Task table for background work
+    """
+
+    def __init__(self, db_path: str, embedder: EmbeddingModel):
+        if np is None:
+            raise RuntimeError("numpy is required. pip install numpy")
+        self.db_path = db_path
+        self.embedder = embedder
+        self._lock = threading.Lock()
+        # `timeout` is sqlite3's busy timeout (seconds); also set PRAGMA busy_timeout (ms) for clarity.
+        self._conn = sqlite3.connect(db_path, check_same_thread=False, timeout=5.0)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA busy_timeout=5000;")
+        self._conn.execute("PRAGMA journal_mode=WAL;")
+        self._conn.execute("PRAGMA synchronous=NORMAL;")
+        self._conn.execute("PRAGMA foreign_keys=ON;")
+        self._fts_ok = False
+        self._init_schema()
+
+    @property
+    def fts_ok(self) -> bool:
+        return bool(self._fts_ok)
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    # ---- schema ----
+
+    def _init_schema(self) -> None:
+        with self._lock:
+            c = self._conn.cursor()
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS episodes(
+                    id TEXT PRIMARY KEY,
+                    ts REAL NOT NULL,
+                    session_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    metadata TEXT
+                );
+            """
+            )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS evidence(
+                    id TEXT PRIMARY KEY,
+                    ts REAL NOT NULL,
+                    kind TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    metadata TEXT,
+                    sha256 TEXT,
+                    emb BLOB,
+                    emb_dim INTEGER
+                );
+            """
+            )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS notes(
+                    id TEXT PRIMARY KEY,
+                    created REAL NOT NULL,
+                    updated REAL NOT NULL,
+                    title TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    tags TEXT,
+                    links TEXT,
+                    source_ids TEXT,
+                    confidence REAL NOT NULL,
+                    emb BLOB,
+                    emb_dim INTEGER
+                );
+            """
+            )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS skills(
+                    id TEXT PRIMARY KEY,
+                    created REAL NOT NULL,
+                    updated REAL NOT NULL,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    preconditions TEXT,
+                    steps TEXT,
+                    tests TEXT,
+                    emb BLOB,
+                    emb_dim INTEGER
+                );
+            """
+            )
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tasks(
+                    id TEXT PRIMARY KEY,
+                    created REAL NOT NULL,
+                    updated REAL NOT NULL,
+                    status TEXT NOT NULL,             -- queued|running|blocked|done|failed
+                    priority INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    parent_id TEXT,                   -- parent task id (for subtasks / dependencies)
+                    payload TEXT,
+                    result TEXT,
+                    evidence_ids TEXT,
+                    error TEXT,
+                    attempts INTEGER NOT NULL,
+                    next_run_ts REAL
+                );
+            """
+            )
+            self._ensure_task_schema(c)
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS proactive(
+                    id TEXT PRIMARY KEY,
+                    ts REAL NOT NULL,
+                    score REAL NOT NULL,
+                    message TEXT NOT NULL,
+                    evidence_ids TEXT,
+                    delivered INTEGER NOT NULL DEFAULT 0
+                );
+            """
+            )
+
+            # FTS5 (lexical)
+            self._fts_ok = self._try_init_fts(c)
+            self._conn.commit()
+
+    def _ensure_task_schema(self, c: sqlite3.Cursor) -> None:
+        """
+        Best-effort task table migrations for existing DBs.
+
+        Keeps the runtime robust even when the schema evolves across versions.
+        """
+        try:
+            cols = {str(r["name"]) for r in c.execute("PRAGMA table_info(tasks)").fetchall()}
+        except Exception:
+            cols = set()
+        if "parent_id" not in cols:
+            try:
+                c.execute("ALTER TABLE tasks ADD COLUMN parent_id TEXT;")
+            except Exception:
+                # If the column exists already or ALTER TABLE isn't possible, ignore.
+                pass
+        # Helpful for dependency checks
+        try:
+            c.execute("CREATE INDEX IF NOT EXISTS idx_tasks_parent_id ON tasks(parent_id);")
+        except Exception:
+            pass
+
+    def _try_init_fts(self, c: sqlite3.Cursor) -> bool:
+        try:
+            c.execute("CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(id UNINDEXED, title, content);")
+            c.execute("CREATE VIRTUAL TABLE IF NOT EXISTS evidence_fts USING fts5(id UNINDEXED, kind, content);")
+            c.execute("CREATE VIRTUAL TABLE IF NOT EXISTS skills_fts USING fts5(id UNINDEXED, name, description);")
+            return True
+        except sqlite3.OperationalError as e:
+            log.warning("FTS5 unavailable; lexical search disabled: %s", e, exc_info=True)
+            return False
+
+    # ---- embeddings storage ----
+
+    def _to_blob(self, v: "np.ndarray") -> Tuple[bytes, int]:
+        v = np.asarray(v, dtype=np.float32)
+        return v.tobytes(), int(v.shape[0])
+
+    def _from_blob(self, b: Optional[bytes], dim: Optional[int]) -> "np.ndarray":
+        target_dim = int(dim) if dim is not None else int(self.embedder.dim)
+        if b is None or target_dim <= 0:
+            fallback_dim = target_dim if target_dim > 0 else int(self.embedder.dim)
+            return np.zeros((fallback_dim,), dtype=np.float32)
+        v = np.frombuffer(b, dtype=np.float32)
+        if v.size == target_dim:
+            return v
+        if v.size > target_dim:
+            return v[:target_dim]
+        out = np.zeros((target_dim,), dtype=np.float32)
+        out[: v.size] = v
+        return out
+
+    # ---- episode ----
+
+    def add_episode(
+        self, session_id: str, role: str, content: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> str:
+        eid = new_id("ep")
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO episodes(id, ts, session_id, role, content, metadata) VALUES (?, ?, ?, ?, ?, ?)",
+                (eid, utc_ts(), session_id, role, content, jdump(metadata or {})),
+            )
+            self._conn.commit()
+        return eid
+
+    def recent_episodes(self, session_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, ts, role, content, metadata FROM episodes WHERE session_id=? ORDER BY ts DESC LIMIT ?",
+                (session_id, int(limit)),
+            ).fetchall()
+        out = []
+        for r in rows:
+            out.append(
+                {
+                    "id": r["id"],
+                    "ts": r["ts"],
+                    "role": r["role"],
+                    "content": r["content"],
+                    "metadata": jload(r["metadata"]) or {},
+                }
+            )
+        return out
+
+    def count_episodes(self, session_id: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(1) AS n FROM episodes WHERE session_id=?", (session_id,)
+            ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def oldest_episodes(self, session_id: str, limit: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, ts, role, content, metadata FROM episodes WHERE session_id=? ORDER BY ts ASC LIMIT ?",
+                (session_id, int(limit)),
+            ).fetchall()
+        out = []
+        for r in rows:
+            out.append(
+                {
+                    "id": r["id"],
+                    "ts": r["ts"],
+                    "role": r["role"],
+                    "content": r["content"],
+                    "metadata": jload(r["metadata"]) or {},
+                }
+            )
+        return out
+
+    def delete_episodes(self, episode_ids: Sequence[str]) -> int:
+        ids = [str(i) for i in episode_ids if str(i).strip()]
+        if not ids:
+            return 0
+        with self._lock:
+            q = ",".join(["?"] * len(ids))
+            cur = self._conn.execute(f"DELETE FROM episodes WHERE id IN ({q})", ids)
+            self._conn.commit()
+        if cur.rowcount is None or cur.rowcount < 0:
+            return len(ids)
+        return int(cur.rowcount)
+
+    # ---- evidence ----
+
+    def add_evidence(
+        self, kind: str, content: str, metadata: Optional[Dict[str, Any]] = None, *, dedupe: bool = True
+    ) -> str:
+        content = content if isinstance(content, str) else str(content)
+        sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+        if dedupe:
+            with self._lock:
+                row = self._conn.execute("SELECT id FROM evidence WHERE sha256=? AND kind=?", (sha, kind)).fetchone()
+                if row:
+                    return str(row["id"])
+
+        evid = new_id("ev")
+        emb = self.embedder.embed(content)
+        blob, dim = self._to_blob(emb)
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO evidence(id, ts, kind, content, metadata, sha256, emb, emb_dim) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (evid, utc_ts(), kind, content, jdump(metadata or {}), sha, blob, dim),
+            )
+            if self._fts_ok:
+                self._fts_upsert("evidence_fts", evid, {"kind": kind, "content": content})
+            self._conn.commit()
+        return evid
+
+    def get_evidence(self, evid: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, ts, kind, content, metadata FROM evidence WHERE id=?",
+                (evid,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row["id"],
+            "ts": row["ts"],
+            "kind": row["kind"],
+            "content": row["content"],
+            "metadata": jload(row["metadata"]) or {},
+        }
+
+    # ---- notes ----
+
+    def add_note(
+        self,
+        title: str,
+        content: str,
+        *,
+        tags: Optional[List[str]] = None,
+        source_ids: Optional[List[str]] = None,
+        confidence: float = 0.7,
+        links: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        nid = new_id("note")
+        now = utc_ts()
+        emb = self.embedder.embed(title + "\n" + content)
+        blob, dim = self._to_blob(emb)
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO notes(id, created, updated, title, content, tags, links, source_ids, confidence, emb, emb_dim) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    nid,
+                    now,
+                    now,
+                    title,
+                    content,
+                    jdump(tags or []),
+                    jdump(links or []),
+                    jdump(source_ids or []),
+                    float(confidence),
+                    blob,
+                    dim,
+                ),
+            )
+            if self._fts_ok:
+                self._fts_upsert("notes_fts", nid, {"title": title, "content": content})
+            self._conn.commit()
+        return nid
+
+    def get_note(self, nid: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM notes WHERE id=?", (nid,)).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row["id"],
+            "created": row["created"],
+            "updated": row["updated"],
+            "title": row["title"],
+            "content": row["content"],
+            "tags": jload(row["tags"]) or [],
+            "links": jload(row["links"]) or [],
+            "source_ids": jload(row["source_ids"]) or [],
+            "confidence": float(row["confidence"]),
+        }
+
+    def update_note(
+        self,
+        nid: str,
+        *,
+        title: Optional[str] = None,
+        content: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        links: Optional[List[Dict[str, Any]]] = None,
+        confidence: Optional[float] = None,
+    ) -> bool:
+        cur = self.get_note(nid)
+        if not cur:
+            return False
+        new_title = title if title is not None else cur["title"]
+        new_content = content if content is not None else cur["content"]
+
+        fields: Dict[str, Any] = {"updated": utc_ts()}
+        if title is not None:
+            fields["title"] = new_title
+        if content is not None:
+            fields["content"] = new_content
+        if tags is not None:
+            fields["tags"] = jdump(tags)
+        if links is not None:
+            fields["links"] = jdump(links)
+        if confidence is not None:
+            fields["confidence"] = float(confidence)
+
+        if title is not None or content is not None:
+            emb = self.embedder.embed(new_title + "\n" + new_content)
+            blob, dim = self._to_blob(emb)
+            fields["emb"] = blob
+            fields["emb_dim"] = dim
+
+        set_clause = ", ".join([f"{k}=?" for k in fields.keys()])
+        vals = list(fields.values()) + [nid]
+
+        with self._lock:
+            self._conn.execute(f"UPDATE notes SET {set_clause} WHERE id=?", vals)
+            if self._fts_ok and (title is not None or content is not None):
+                self._fts_upsert("notes_fts", nid, {"title": new_title, "content": new_content})
+            self._conn.commit()
+        return True
+
+    def list_notes(self, limit: int = 20) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, updated, title, tags, links, confidence FROM notes ORDER BY updated DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        out = []
+        for r in rows:
+            out.append(
+                {
+                    "id": r["id"],
+                    "updated": r["updated"],
+                    "title": r["title"],
+                    "tags": jload(r["tags"]) or [],
+                    "links": jload(r["links"]) or [],
+                    "confidence": float(r["confidence"]),
+                }
+            )
+        return out
+
+    def link_notes(self, a: str, b: str, relation: str, score: float) -> None:
+        na = self.get_note(a)
+        nb = self.get_note(b)
+        if not na or not nb:
+            return
+
+        def add_link(note: Dict[str, Any], to: str) -> List[Dict[str, Any]]:
+            links = list(note.get("links") or [])
+            if any(l.get("to") == to and l.get("relation") == relation for l in links):
+                return links
+            links.append({"to": to, "relation": relation, "score": float(score), "ts": utc_ts()})
+            return links
+
+        self.update_note(a, links=add_link(na, b))
+        self.update_note(b, links=add_link(nb, a))
+
+    # ---- skills ----
+
+    def add_skill(
+        self,
+        name: str,
+        description: str,
+        *,
+        preconditions: Optional[Dict[str, Any]] = None,
+        steps: Optional[List[Dict[str, Any]]] = None,
+        tests: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        sid = new_id("skill")
+        now = utc_ts()
+        emb = self.embedder.embed(name + "\n" + description)
+        blob, dim = self._to_blob(emb)
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO skills(id, created, updated, name, description, preconditions, steps, tests, emb, emb_dim) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (sid, now, now, name, description, jdump(preconditions or {}), jdump(steps or []), jdump(tests or []), blob, dim),
+            )
+            if self._fts_ok:
+                self._fts_upsert("skills_fts", sid, {"name": name, "description": description})
+            self._conn.commit()
+        return sid
+
+    def list_skills(self, limit: int = 20) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, updated, name, description FROM skills ORDER BY updated DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        return [
+            {"id": r["id"], "updated": r["updated"], "name": r["name"], "description": short(r["description"], 160)}
+            for r in rows
+        ]
+
+    # ---- tasks ----
+
+    def add_task(
+        self,
+        title: str,
+        description: str,
+        *,
+        priority: int = 0,
+        payload: Optional[Dict[str, Any]] = None,
+        parent_id: Optional[str] = None,
+        next_run_ts: Optional[float] = None,
+    ) -> str:
+        tid = new_id("task")
+        now = utc_ts()
+        # Allow parent linkage to be passed via payload for convenience/back-compat.
+        if parent_id is None and payload:
+            pid = payload.get("parent_id") or payload.get("parent_task_id") or payload.get("parent")
+            if isinstance(pid, str) and pid.strip():
+                parent_id = pid.strip()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO tasks(id, created, updated, status, priority, title, description, parent_id, payload, result, evidence_ids, error, attempts, next_run_ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    tid,
+                    now,
+                    now,
+                    "queued",
+                    int(priority),
+                    title,
+                    description,
+                    parent_id,
+                    jdump(payload or {}),
+                    jdump({}),
+                    jdump([]),
+                    "",
+                    0,
+                    next_run_ts,
+                ),
+            )
+            self._conn.commit()
+        return tid
+
+    def list_tasks(self, limit: int = 50) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, updated, status, priority, title, description, attempts, next_run_ts FROM tasks ORDER BY priority DESC, updated DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        out = []
+        for r in rows:
+            out.append(
+                {
+                    "id": r["id"],
+                    "updated": r["updated"],
+                    "status": r["status"],
+                    "priority": r["priority"],
+                    "title": r["title"],
+                    "description": short(r["description"], 220),
+                    "attempts": r["attempts"],
+                    "next_run_ts": r["next_run_ts"],
+                }
+            )
+        return out
+
+    def fetch_runnable_task(self, now_ts: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        now_ts = utc_ts() if now_ts is None else now_ts
+        with self._lock:
+            # Avoid running a parent task before its children reach a terminal status.
+            row = self._conn.execute(
+                "SELECT * FROM tasks t "
+                "WHERE t.status IN ('queued','blocked') "
+                "AND (t.next_run_ts IS NULL OR t.next_run_ts <= ?) "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM tasks c WHERE c.parent_id = t.id AND c.status NOT IN ('done','failed')"
+                ") "
+                "ORDER BY t.priority DESC, t.updated ASC LIMIT 1",
+                (now_ts,),
+            ).fetchone()
+            if not row:
+                return None
+            # mark running
+            self._conn.execute("UPDATE tasks SET status='running', updated=? WHERE id=?", (utc_ts(), row["id"]))
+            self._conn.commit()
+        return dict(row)
+
+    def complete_task(
+        self,
+        tid: str,
+        *,
+        status: str,
+        result: Optional[Dict[str, Any]] = None,
+        evidence_ids: Optional[List[str]] = None,
+        error: str = "",
+        next_run_ts: Optional[float] = None,
+    ) -> None:
+        now = utc_ts()
+        with self._lock:
+            # Capture parent linkage (if any) so we can wake parents when children finish.
+            parent_id = None
+            try:
+                prow = self._conn.execute("SELECT parent_id FROM tasks WHERE id=?", (tid,)).fetchone()
+                if prow and prow["parent_id"]:
+                    parent_id = str(prow["parent_id"])
+            except Exception:
+                parent_id = None
+            self._conn.execute(
+                "UPDATE tasks SET updated=?, status=?, result=?, evidence_ids=?, error=?, attempts=attempts+1, next_run_ts=? WHERE id=?",
+                (now, status, jdump(result or {}), jdump(evidence_ids or []), error, next_run_ts, tid),
+            )
+            # If this is a child task and it reached a terminal state, allow its parent to run sooner.
+            if parent_id and status in ("done", "failed"):
+                try:
+                    row = self._conn.execute(
+                        "SELECT COUNT(1) AS n FROM tasks WHERE parent_id=? AND status NOT IN ('done','failed')",
+                        (parent_id,),
+                    ).fetchone()
+                    remaining = int(row["n"]) if row else 0
+                    if remaining == 0:
+                        self._conn.execute(
+                            "UPDATE tasks SET updated=?, status=CASE WHEN status='blocked' THEN 'queued' ELSE status END, next_run_ts=NULL "
+                            "WHERE id=? AND status NOT IN ('done','failed')",
+                            (now, parent_id),
+                        )
+                except Exception:
+                    pass
+            self._conn.commit()
+
+    # ---- proactive ----
+
+    def add_proactive(self, message: str, *, score: float, evidence_ids: Optional[List[str]] = None) -> str:
+        pid = new_id("pro")
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO proactive(id, ts, score, message, evidence_ids, delivered) VALUES (?, ?, ?, ?, ?, 0)",
+                (pid, utc_ts(), float(score), message, jdump(evidence_ids or [])),
+            )
+            self._conn.commit()
+        return pid
+
+    def fetch_undelivered_proactive(self, limit: int = 3) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, ts, score, message, evidence_ids FROM proactive WHERE delivered=0 ORDER BY score DESC, ts ASC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+            ids = [r["id"] for r in rows]
+            if ids:
+                self._conn.executemany("UPDATE proactive SET delivered=1 WHERE id=?", [(i,) for i in ids])
+                self._conn.commit()
+        return [
+            {
+                "id": r["id"],
+                "ts": r["ts"],
+                "score": r["score"],
+                "message": r["message"],
+                "evidence_ids": jload(r["evidence_ids"]) or [],
+            }
+            for r in rows
+        ]
+
+    # ---- FTS maintenance ----
+
+    def _fts_upsert(self, table: str, doc_id: str, cols: Dict[str, str]) -> None:
+        if not self._fts_ok:
+            return
+        # delete then insert (simple, robust)
+        self._conn.execute(f"DELETE FROM {table} WHERE id=?", (doc_id,))
+        fields = ["id"] + list(cols.keys())
+        placeholders = ",".join(["?"] * len(fields))
+        values = [doc_id] + [cols[k] for k in cols.keys()]
+        self._conn.execute(f"INSERT INTO {table}({','.join(fields)}) VALUES ({placeholders})", values)
+
+    # ---- hybrid retrieval ----
+
+    def _fts_search(self, fts_table: str, query: str, k: int) -> List[str]:
+        if not self._fts_ok:
+            return []
+        ts = toks(query)
+        if not ts:
+            return []
+        # Construct a "safe" FTS query from tokens to avoid MATCH syntax errors
+        # (e.g. "User:" is parsed as a column selector).
+        q = " OR ".join(ts[:64])
+        with self._lock:
+            # bm25 smaller is better; we only use ranking order.
+            rows = self._conn.execute(
+                f"SELECT id, bm25({fts_table}) AS r FROM {fts_table} WHERE {fts_table} MATCH ? ORDER BY r LIMIT ?",
+                (q, int(k)),
+            ).fetchall()
+        return [str(r["id"]) for r in rows]
+
+    def _vector_candidates(self, table: str, query_vec: "np.ndarray", k: int) -> List[Tuple[str, float]]:
+        if np is None:
+            return []
+        q = np.asarray(query_vec, dtype=np.float32).reshape(-1)
+        q_dim = int(q.shape[0])
+        if q_dim <= 0:
+            return []
+
+        kk = int(k)
+        if kk <= 0:
+            return []
+
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT id, emb FROM {table} WHERE emb IS NOT NULL AND emb_dim=?",
+                (q_dim,),
+            ).fetchall()
+        if not rows:
+            return []
+
+        ids: List[str] = []
+        embs = np.empty((len(rows), q_dim), dtype=np.float32)
+        for i, r in enumerate(rows):
+            ids.append(str(r["id"]))
+            try:
+                embs[i, :] = np.frombuffer(r["emb"], dtype=np.float32, count=q_dim)
+            except Exception:
+                embs[i, :] = 0.0
+
+        qn = float(np.linalg.norm(q))
+        if qn == 0.0:
+            return []
+        en = np.linalg.norm(embs, axis=1) * qn
+        en = np.where(en == 0.0, 1e-12, en)
+        scores = (embs @ q) / en
+
+        if scores.shape[0] <= kk:
+            idx = np.argsort(-scores)
+        else:
+            idx_part = np.argpartition(-scores, kk - 1)[:kk]
+            idx = idx_part[np.argsort(-scores[idx_part])]
+
+        return [(ids[i], float(scores[i])) for i in idx]
+
+    @staticmethod
+    def _rrf_fuse(rankings: List[List[str]], *, k: int = 60) -> List[Tuple[str, float]]:
+        scores: Dict[str, float] = {}
+        for ranking in rankings:
+            for rank, doc_id in enumerate(ranking, start=1):
+                scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
+        return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+    def search_notes(self, query: str, k: int = 5, *, fts_k: int = 30, vec_k: int = 30) -> List[Dict[str, Any]]:
+        qv = self.embedder.embed(query)
+        lex_ids = self._fts_search("notes_fts", query, fts_k)
+        vec = self._vector_candidates("notes", qv, vec_k)
+        vec_ids = [i for i, _ in vec]
+        fused = self._rrf_fuse([lex_ids, vec_ids])[: int(k)]
+
+        out = []
+        for doc_id, score in fused:
+            n = self.get_note(doc_id)
+            if not n:
+                continue
+            tags = list(n.get("tags") or [])
+            source_ids = list(n.get("source_ids") or [])
+            conf = float(n.get("confidence", 0.5))
+            # Heuristic trust: user-sourced notes are easier to poison; treat as lower trust by default.
+            trust = 0.25 + 0.5 * conf
+            if any(str(s).startswith("ep_") for s in source_ids):
+                trust = min(trust, 0.35)
+            if ("conversation" in tags) or ("episode_digest" in tags):
+                trust = min(trust, 0.45)
+            trust = max(0.0, min(1.0, trust))
+            out.append(
+                {
+                    "id": n["id"],
+                    "title": n["title"],
+                    "content_snip": short(n["content"], 800),
+                    "tags": tags,
+                    "links": n["links"],
+                    "source_ids": source_ids,
+                    "confidence": conf,
+                    "trust_score": float(trust),
+                    "score": float(score),
+                }
+            )
+        return out
+
+    def search_evidence(
+        self, query: str, k: int = 5, *, fts_k: int = 30, vec_k: int = 30
+    ) -> List[Dict[str, Any]]:
+        qv = self.embedder.embed(query)
+        lex_ids = self._fts_search("evidence_fts", query, fts_k)
+        vec = self._vector_candidates("evidence", qv, vec_k)
+        vec_ids = [i for i, _ in vec]
+        fused = self._rrf_fuse([lex_ids, vec_ids])[: int(k)]
+
+        out = []
+        for doc_id, score in fused:
+            ev = self.get_evidence(doc_id)
+            if not ev:
+                continue
+            md = ev.get("metadata") or {}
+            try:
+                trust = float(md.get("trust_score", 1.0))
+            except Exception:
+                trust = 1.0
+            out.append(
+                {
+                    "id": ev["id"],
+                    "kind": ev["kind"],
+                    "content_snip": short(ev["content"], 800),
+                    "source_type": str(md.get("source_type", "")),
+                    "trust_score": float(trust),
+                    "score": float(score),
+                }
+            )
+        return out
+
+    def search_skills(self, query: str, k: int = 5, *, fts_k: int = 30, vec_k: int = 30) -> List[Dict[str, Any]]:
+        qv = self.embedder.embed(query)
+        lex_ids = self._fts_search("skills_fts", query, fts_k)
+        vec = self._vector_candidates("skills", qv, vec_k)
+        vec_ids = [i for i, _ in vec]
+        fused = self._rrf_fuse([lex_ids, vec_ids])[: int(k)]
+
+        out = []
+        for doc_id, score in fused:
+            with self._lock:
+                row = self._conn.execute("SELECT id, name, description FROM skills WHERE id=?", (doc_id,)).fetchone()
+            if not row:
+                continue
+            out.append(
+                {
+                    "id": row["id"],
+                    "name": row["name"],
+                    "description": short(row["description"], 800),
+                    "score": float(score),
+                }
+            )
+        return out
+
+
+
+---
+File: /cogos/model.py
+---
+
+from __future__ import annotations
+
+import os
+import shutil
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Tuple
+
+from .logging_utils import log
+
+
+@dataclass(frozen=True)
+class HFModelSpec:
+    repo_id: str
+    filename: str
+    revision: str = "main"
+
+
+DEFAULT_HF_MODEL = HFModelSpec(
+    repo_id=os.environ.get("COGOS_LLAMA_HF_REPO", "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF"),
+    filename=os.environ.get("COGOS_LLAMA_HF_FILE", "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"),
+    revision=os.environ.get("COGOS_LLAMA_HF_REV", "main"),
+)
+
+
+def _parse_hf_ref(ref: str) -> HFModelSpec:
+    """
+    Parse `hf://org/repo/path/to/file.gguf[@revision]`.
+    """
+    if not ref.startswith("hf://"):
+        raise ValueError("hf ref must start with 'hf://'")
+    rest = ref[len("hf://") :]
+    revision = "main"
+    if "@" in rest:
+        rest, revision = rest.rsplit("@", 1)
+        revision = revision.strip() or "main"
+
+    parts = [p for p in rest.split("/") if p]
+    if len(parts) < 3:
+        raise ValueError("hf ref must be 'hf://org/repo/<filename>'")
+
+    repo_id = "/".join(parts[:2])
+    filename = "/".join(parts[2:])
+    return HFModelSpec(repo_id=repo_id, filename=filename, revision=revision)
+
+
+def _hf_resolve_url(spec: HFModelSpec) -> str:
+    # Works for public repos; will 302 to the actual storage backend (LFS).
+    return f"https://huggingface.co/{spec.repo_id}/resolve/{spec.revision}/{spec.filename}?download=true"
+
+
+def _download(url: str, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+
+    req = urllib.request.Request(url, headers={"User-Agent": "cogos/0.1 (+https://github.com/theapemachine/architecture)"})
+    try:
+        with urllib.request.urlopen(req) as r, tmp.open("wb") as f:  # noqa: S310
+            shutil.copyfileobj(r, f)
+        os.replace(tmp, dest)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+
+
+def ensure_hf_model(spec: HFModelSpec, *, model_dir: Path) -> Path:
+    """
+    Ensure the model is present on disk, downloading if needed.
+
+    Files are stored under: `<model_dir>/hf/<repo_id>/<revision>/<filename>`.
+    """
+    dest = model_dir / "hf" / spec.repo_id / spec.revision / spec.filename
+    if dest.exists():
+        return dest
+
+    url = _hf_resolve_url(spec)
+    log.info("Downloading GGUF model: %s -> %s", url, dest)
+    _download(url, dest)
+    return dest
+
+
+def resolve_llama_model_path(
+    llama_model: str,
+    *,
+    auto_download: bool,
+    model_dir: str,
+    default_spec: Optional[HFModelSpec] = None,
+) -> str:
+    """
+    Resolve a llama.cpp model reference into a local file path.
+
+    Supported values:
+    - local filesystem path to a `.gguf` file
+    - `hf://org/repo/path/to/file.gguf[@revision]` (download if missing)
+    - empty + `auto_download=True` (download DEFAULT_HF_MODEL unless overridden)
+    """
+    model_dir_path = Path(model_dir).expanduser().resolve()
+    spec = default_spec or DEFAULT_HF_MODEL
+
+    m = (llama_model or "").strip()
+    if m.lower() in ("default", "auto"):
+        m = ""
+        auto_download = True
+
+    if m.startswith("hf://"):
+        hf_spec = _parse_hf_ref(m)
+        return str(ensure_hf_model(hf_spec, model_dir=model_dir_path))
+
+    if not m:
+        if not auto_download:
+            raise ValueError("--llama-model is required (or use --llama-auto-download / --llama-model hf://...)")
+        return str(ensure_hf_model(spec, model_dir=model_dir_path))
+
+    p = Path(m).expanduser()
+    if not p.exists():
+        raise FileNotFoundError(f"llama model not found: {p}")
+    return str(p.resolve())
+
+
+
+
+---
+File: /cogos/notary.py
+---
+
+"""Notary escalation mechanism.
+
+The Notary is a small, internal "hard-line cut" that records an escalation trace
+when the system cannot produce a verified answer after allowed steering.
+"""
+
+from __future__ import annotations
+
+from typing import cast, final
+
+from .ir import Plan, VerifiedAnswer
+from .logging_utils import log
+from .memory import MemoryStore
+from . import pyd_compat
+from .tools import ToolOutcome
+from .util import jdump, short, utc_ts
+
+
+JsonValue = str | int | float | bool | None | dict[str, "JsonValue"] | list["JsonValue"]
+JsonObject = dict[str, JsonValue]
+
+
+class NotaryReport(pyd_compat.BaseModel):
+    """Structured return value for a Notary escalation."""
+
+    escalated: bool
+    task_id: str | None = None
+    evidence_id: str | None = None
+    reason: str = ""
+
+
+@final
+class Notary:
+    """
+    Minimal "hard-line cut" mechanism.
+
+    The Notary is not user-interactive: it records an internal trace and (optionally)
+    creates a high-priority task for human review when the system cannot produce a
+    verified answer after its allowed steering attempts.
+    """
+
+    def __init__(self, memory: MemoryStore, *, priority: int = 10):
+        self.memory = memory
+        self.priority = int(priority)
+
+    def escalate(
+        self,
+        *,
+        user_text: str,
+        plan: Plan,
+        verified: VerifiedAnswer,
+        tool_outcomes: list[ToolOutcome],
+        reason: str,
+    ) -> NotaryReport:
+        """Record an escalation trace and enqueue a human-review task."""
+
+        normalized_reason = str(reason) if reason else "unspecified"
+        payload: JsonObject = {
+            "ts": utc_ts(),
+            "reason": normalized_reason,
+            "user_text": user_text,
+            "plan": cast(JsonObject, pyd_compat.model_dump(plan)),
+            "verified": cast(JsonObject, pyd_compat.model_dump(verified)),
+            "tool_outcomes": [
+                cast(JsonObject, pyd_compat.model_dump(o)) for o in (tool_outcomes or [])
+            ],
+        }
+
+        evid = self.memory.add_evidence(
+            "notary_escalation",
+            jdump(payload),
+            metadata={"source_type": "notary", "trust_score": 1.0},
+            dedupe=False,
+        )
+
+        desc = (
+            "CogOS could not produce a verified answer.\n\n"
+            f"reason: {normalized_reason}\n"
+            f"evidence_id: {evid}\n"
+            f"user_text_snip: {short(user_text, 400)}\n"
+        )
+        tid = self.memory.add_task(
+            "Human review required (CogOS Notary)",
+            desc,
+            priority=self.priority,
+            payload={
+                "evidence_id": evid,
+                "reason": normalized_reason,
+                "ts": payload["ts"],
+            },
+        )
+
+        log.warning(
+            "Notary escalation created (task=%s evidence=%s reason=%s)",
+            tid,
+            evid,
+            normalized_reason,
+            extra={"extra": {"task_id": tid, "evidence_id": evid, "reason": normalized_reason}},
+        )
+        return NotaryReport(
+            escalated=True,
+            task_id=tid,
+            evidence_id=evid,
+            reason=normalized_reason,
+        )
+
+
+
+---
+File: /cogos/np_compat.py
+---
+
+from __future__ import annotations
+
+try:
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover
+    np = None  # type: ignore
+
+
+
+
+---
+File: /cogos/planner.py
+---
+
+from __future__ import annotations
+
+import re
+from typing import Any, Dict, List
+
+from .ir import Plan, PlanStep, StepMemorySearch, StepRespond, StepToolCall
+from .llm import ChatMessage, ChatModel
+from .memory import MemoryStore
+from .tools import ToolBus
+from .util import jdump
+
+
+class Planner:
+    def plan(self, user_text: str, *, tools: ToolBus, memory: MemoryStore) -> Plan:
+        raise NotImplementedError
+
+
+class RulePlanner(Planner):
+    _ARITH = re.compile(r"(?<!\w)(?:\d+\s*[\+\-\*/\^]\s*\d+|calculate|compute|eval|evaluate)(?!\w)", re.IGNORECASE)
+    _COUNT_LETTER = re.compile(
+        r"how many times\s+(?:is|does)?\s*(?:the\s+)?letter\s+['\"]?([a-z])['\"]?\s+(?:appear(?:s)?\s+)?(?:in|within)\s+(?:the\s+)?(?:word\s+)?['\"]?([a-z]+)['\"]?",
+        re.IGNORECASE,
+    )
+
+    def plan(self, user_text: str, *, tools: ToolBus, memory: MemoryStore) -> Plan:  # noqa: ARG002
+        # Deterministic string counting.
+        m = self._COUNT_LETTER.search(user_text or "")
+        if m:
+            ch = (m.group(1) or "").strip()
+            word = (m.group(2) or "").strip()
+            steps: List[PlanStep] = [
+                StepToolCall(tool="count_chars", arguments={"text": word, "char": ch, "case_sensitive": False})
+            ]
+            steps.append(StepRespond())
+            return Plan(steps=steps)
+
+        # Deterministic arithmetic.
+        if self._ARITH.search(user_text):
+            expr = user_text
+            m = re.search(r"(?:calculate|compute|eval|evaluate)\s*[:\-]?\s*(.*)$", user_text, re.IGNORECASE)
+            if m and m.group(1).strip():
+                expr = m.group(1).strip()
+            steps = [StepToolCall(tool="calc", arguments={"expression": expr})]
+            steps.append(StepRespond())
+            return Plan(steps=steps)
+
+        steps = [StepMemorySearch(query=user_text, k=6)]
+        steps.append(StepRespond())
+        return Plan(steps=steps)
+
+
+class LLMPlanner(Planner):
+    def __init__(self, model: ChatModel):
+        self.model = model
+
+    def plan(self, user_text: str, *, tools: ToolBus, memory: MemoryStore) -> Plan:  # noqa: ARG002
+        compact_tools = []
+        for t in tools.list_tools():
+            props = (t["input_schema"].get("properties") or {})
+            compact_tools.append(
+                {
+                    "name": t["name"],
+                    "description": t["description"],
+                    "side_effects": t["side_effects"],
+                    "args": list(props.keys()),
+                }
+            )
+
+        sys = (
+            "You are a planning compiler. Output JSON only.\n"
+            "Return a JSON object with this shape:\n"
+            "{\"steps\":[ ... ]}\n\n"
+            "Each step must be one of:\n"
+            "- memory_search: {\"type\":\"memory_search\",\"query\":str,\"k\":int}\n"
+            "- tool_call:    {\"type\":\"tool_call\",\"tool\":str,\"arguments\":object}\n"
+            "- write_note:   {\"type\":\"write_note\",\"title\":str,\"content\":str,\"tags\":[str],\"confidence\":number}\n"
+            "- create_task:  {\"type\":\"create_task\",\"title\":str,\"description\":str,\"priority\":int,\"payload\":object}\n"
+            "- respond:      {\"type\":\"respond\",\"style\":str}\n\n"
+            "Rules (hard):\n"
+            "- steps must be non-empty.\n"
+            "- The last step MUST be respond.\n"
+            "- arguments MUST be an object ({}), not a list.\n"
+            "- payload MUST be an object ({}), not a list.\n"
+            "- Use the exact key order shown in each step format.\n"
+            "- Do not add extra keys.\n"
+            "- Do NOT create_task or write_note unless the user explicitly asked.\n"
+            "- Avoid side-effect tools unless required.\n\n"
+            "Guidance:\n"
+            "- Use tool_call 'count_chars' for letter counting questions.\n\n"
+            "Examples:\n"
+            "User: hi\n"
+            "{\"steps\":[{\"type\":\"respond\",\"style\":\"helpful\"}]}\n\n"
+            "User: calculate 2+2\n"
+            "{\"steps\":[{\"type\":\"tool_call\",\"tool\":\"calc\",\"arguments\":{\"expression\":\"2+2\"}},{\"type\":\"respond\",\"style\":\"helpful\"}]}\n"
+            "\n"
+            "User: How many times is the letter r in the word strawberry?\n"
+            "{\"steps\":[{\"type\":\"tool_call\",\"tool\":\"count_chars\",\"arguments\":{\"text\":\"strawberry\",\"char\":\"r\",\"case_sensitive\":false}},{\"type\":\"respond\",\"style\":\"helpful\"}]}\n"
+        )
+        user = (
+            "User request:\n"
+            + user_text
+            + "\n\nAvailable tools:\n"
+            + jdump(compact_tools)
+            + "\n\nReturn JSON only."
+        )
+        msgs = [ChatMessage(role="system", content=sys), ChatMessage(role="user", content=user)]
+        plan = self.model.generate_json(msgs, Plan, temperature=0.1, max_tokens=900)
+        if not isinstance(plan, Plan):
+            raise TypeError(f"LLMPlanner expected Plan, got {type(plan).__name__}")
+        if not plan.steps:
+            raise ValueError("LLMPlanner returned an empty plan (no steps).")
+        if not isinstance(plan.steps[-1], StepRespond):
+            raise ValueError("LLMPlanner plan must end with a respond step.")
+        return plan
+
+
+
+---
+File: /cogos/pyd_compat.py
+---
+
+from __future__ import annotations
+
+from typing import Any, Callable, cast
+
+
+# Define these unconditionally so static analyzers always see them as exported.
+class ValidationError(RuntimeError):  # noqa: D101
+    pass
+
+
+class BaseModel:  # noqa: D101
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("pydantic is required. Install with: pip install pydantic")
+
+    def dict(self, *args: Any, **kwargs: Any) -> dict[str, object]:
+        raise RuntimeError("pydantic is required. Install with: pip install pydantic")
+
+    def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, object]:
+        raise RuntimeError("pydantic is required. Install with: pip install pydantic")
+
+
+def Field(  # noqa: D103
+    default: object = None,
+    *,
+    default_factory: Callable[[], object] | None = None,
+    **kwargs: Any,
+) -> object:
+    _ = kwargs
+    if default_factory is not None:
+        return default_factory()
+    return default
+
+
+try:  # pragma: no cover
+    from pydantic import BaseModel as _PBaseModel
+    from pydantic import Field as _PField
+    from pydantic import ValidationError as _PValidationError
+
+    BaseModel = _PBaseModel
+    Field = _PField
+    ValidationError = _PValidationError
+except Exception:
+    pass
+
+
+def model_dump(m: BaseModel) -> dict[str, object]:
+    """
+    Compatibility wrapper for pydantic v1/v2.
+    """
+
+    # v2
+    fn = getattr(m, "model_dump", None)
+    if callable(fn):
+        return cast(dict[str, object], fn())
+
+    # v1
+    fn = getattr(m, "dict", None)
+    if callable(fn):
+        return cast(dict[str, object], fn())
+
+    return {}
+
+
+def model_json_schema(model: type[BaseModel]) -> dict[str, object]:
+    """
+    Compatibility wrapper for pydantic v1/v2.
+    """
+
+    # v2
+    fn = getattr(model, "model_json_schema", None)
+    if callable(fn):
+        return cast(dict[str, object], fn())
+
+    # v1
+    fn = getattr(model, "schema", None)
+    if callable(fn):
+        return cast(dict[str, object], fn())
+
+    return {}
+
+
+# Back-compat aliases (avoid importing the underscored names in new code).
+_model_dump = model_dump
+_model_json_schema = model_json_schema
+
+
+__all__ = [
+    "BaseModel",
+    "Field",
+    "ValidationError",
+    "model_dump",
+    "model_json_schema",
+]
+
+
+
+
+---
+File: /cogos/pyd_compat.pyi
+---
+
+from __future__ import annotations
+
+from typing import Any, Callable, Self, TypeVar, overload
+
+T = TypeVar("T")
+
+
+class ValidationError(Exception): ...
+
+
+class BaseModel:
+    # Minimal pydantic-like surface used by this project.
+    def __init__(self, *args: object, **kwargs: object) -> None: ...
+    def dict(self, *args: object, **kwargs: object) -> dict[str, object]: ...
+    def model_dump(self, *args: object, **kwargs: object) -> dict[str, object]: ...
+    def copy(self, *args: object, **kwargs: object) -> Self: ...
+    def model_copy(self, *args: object, **kwargs: object) -> Self: ...
+
+
+@overload
+def Field(
+    default: T,
+    *,
+    default_factory: None = ...,
+    **kwargs: object,
+) -> T: ...
+
+@overload
+def Field(*, default_factory: None = ..., **kwargs: object) -> object: ...
+
+
+@overload
+def Field(
+    default: object = ...,
+    *,
+    default_factory: Callable[[], T],
+    **kwargs: object,
+) -> T: ...
+
+
+def model_dump(m: BaseModel) -> dict[str, object]: ...
+def model_json_schema(model: type[BaseModel]) -> dict[str, object]: ...
+
+# Back-compat aliases.
+_model_dump = model_dump
+_model_json_schema = model_json_schema
+
+
+
+
+
+---
+File: /cogos/reasoner.py
+---
+
+from __future__ import annotations
+
+import json
+import re
+from typing import Any, Dict, List, Literal, Optional
+
+from .ir import Claim, Plan, ProposedAnswer
+from .llm import ChatMessage, ChatModel
+from .pyd_compat import BaseModel, Field
+from .tools import ToolOutcome
+from .util import toks
+
+
+class Reasoner:
+    def propose(
+        self,
+        user_text: str,
+        *,
+        plan: Plan,
+        evidence_map: Dict[str, str],
+        memory_hits: Dict[str, Any],
+        tool_outcomes: List[ToolOutcome],
+    ) -> ProposedAnswer:
+        raise NotImplementedError
+
+
+class ConservativeReasoner(Reasoner):
+    """No LLM: produces only tool-derived and memory-search derived claims."""
+
+    def propose(
+        self,
+        user_text: str,  # noqa: ARG002
+        *,
+        plan: Plan,  # noqa: ARG002
+        evidence_map: Dict[str, str],  # noqa: ARG002
+        memory_hits: Dict[str, Any],
+        tool_outcomes: List[ToolOutcome],
+    ) -> ProposedAnswer:
+        claims: List[Claim] = []
+        # calc results
+        for out in tool_outcomes:
+            if out.ok and out.evidence_id and "result" in out.output:
+                claims.append(
+                    Claim(
+                        text=f"Computed result: {out.output['result']}",
+                        evidence_ids=[out.evidence_id],
+                        support_spans=[str(out.output["result"])],
+                        kind="math",
+                    )
+                )
+
+        # string counts
+        for out in tool_outcomes:
+            if not (out.ok and out.evidence_id and out.tool == "count_chars"):
+                continue
+            text = str(out.output.get("text", "")).strip()
+            char = str(out.output.get("char", "")).strip()
+            count = out.output.get("count")
+            if not text or not char or count is None:
+                continue
+            claims.append(
+                Claim(
+                    text=f"The letter {char} appears {count} time(s) in the word {text}.",
+                    evidence_ids=[out.evidence_id],
+                    support_spans=[str(count), char, text],
+                    kind="math",
+                )
+            )
+
+        # surface top memory hits as "related items" (not asserting facts)
+        mem_evid = next((o for o in tool_outcomes if o.ok and o.tool == "memory_search" and o.evidence_id), None)
+        if mem_evid and mem_evid.evidence_id:
+            notes = memory_hits.get("notes") or []
+            if notes:
+                line = ", ".join([f"{n.get('title')}({n.get('id')})" for n in notes[:3] if n.get("id")])
+                claims.append(
+                    Claim(
+                        text=f"Related notes: {line}",
+                        evidence_ids=[mem_evid.evidence_id],
+                        support_spans=[notes[0].get("id", "")],
+                        kind="fact",
+                    )
+                )
+        return ProposedAnswer(claims=claims, draft="Here is what I can ground from tools/memory.", proactive=[])
+
+
+class LLMReasoner(Reasoner):
+    def __init__(self, model: ChatModel):
+        self.model = model
+
+    @staticmethod
+    def _build_span_menu(evidence_text: str, user_text: str, *, max_spans: int = 14) -> List[str]:
+        """
+        Build a small menu of candidate support spans extracted from `evidence_text`.
+
+        The model will cite spans by index, and we will map indices back to the exact
+        substring. This avoids brittle "copy/paste exact substring" behavior.
+        """
+        txt = str(evidence_text or "")
+        if not txt:
+            return []
+
+        MAX_LEN = 120
+        max_spans = max(1, int(max_spans))
+        user_tokens = set(toks(user_text or ""))
+
+        def score(seg: str) -> float:
+            st = set(toks(seg))
+            if not st:
+                return 0.0
+            if not user_tokens:
+                return 0.0
+            return len(st & user_tokens) / len(st)
+
+        def add(menu: List[str], seen: set[str], seg: str) -> None:
+            if not seg:
+                return
+            s = str(seg)
+            if "\n" in s:
+                return
+            s = s.strip()
+            if not s:
+                return
+            if len(s) > MAX_LEN:
+                s = s[:MAX_LEN]
+            if s in seen:
+                return
+            seen.add(s)
+            menu.append(s)
+
+        # Candidates (all extracted as exact substrings or slices thereof).
+        kv_pat = re.compile(
+            r'"[^"\n]{1,60}"\s*:\s*(?:"[^"\n]{0,60}"|-?\d+(?:\.\d+)?|true|false|null)',
+            re.IGNORECASE,
+        )
+        kv = [m.group(0) for m in kv_pat.finditer(txt)]
+
+        quote_pat = re.compile(r'"[^"\n]{1,80}"')
+        quotes = [m.group(0) for m in quote_pat.finditer(txt)]
+
+        nums = re.findall(r"-?\d+(?:\.\d+)?", txt)
+        lines = [ln for ln in txt.splitlines() if ln and ln.strip()]
+
+        # Relevance-sort the "semantic" candidates; keep numbers separately.
+        kv_sorted = sorted(kv, key=lambda s: (-score(s), len(s)))
+        quotes_sorted = sorted(quotes, key=lambda s: (-score(s), len(s)))
+        lines_sorted = sorted(lines, key=lambda s: (-score(s), len(s)))
+
+        menu: List[str] = []
+        seen: set[str] = set()
+
+        # Always include the first non-empty line slice (helpful fallback context).
+        for ln in lines:
+            add(menu, seen, ln)
+            break
+
+        # Prefer structured fragments (JSON-ish key/value pairs).
+        for seg in kv_sorted[: max_spans * 2]:
+            add(menu, seen, seg)
+            if len(menu) >= max_spans:
+                return menu
+
+        # Include a handful of numeric atoms.
+        for n in nums[: max_spans * 2]:
+            add(menu, seen, n)
+            if len(menu) >= max_spans:
+                return menu
+
+        # Fill remaining slots with relevant quoted strings and lines.
+        for seg in quotes_sorted:
+            add(menu, seen, seg)
+            if len(menu) >= max_spans:
+                return menu
+        for seg in lines_sorted:
+            add(menu, seen, seg)
+            if len(menu) >= max_spans:
+                return menu
+
+        return menu[:max_spans]
+
+    class _RawClaim(BaseModel):
+        text: str
+        evidence_ids: List[str]
+        support_span_ids: List[int]
+        kind: Literal["fact", "math", "inference"] = "fact"
+
+    class _Schema(BaseModel):
+        claims: List["LLMReasoner._RawClaim"]
+        draft: str
+        proactive: List[Dict[str, Any]]
+
+    def propose(
+        self,
+        user_text: str,
+        *,
+        plan: Plan,  # noqa: ARG002
+        evidence_map: Dict[str, str],
+        memory_hits: Dict[str, Any],  # noqa: ARG002
+        tool_outcomes: List[ToolOutcome],  # noqa: ARG002
+    ) -> ProposedAnswer:
+        def _ev_excerpt(s: str, n: int) -> str:
+            if not s:
+                return ""
+            return s if len(s) <= n else s[:n]
+
+        blocks: List[str] = []
+        span_menus: Dict[str, List[str]] = {}
+        for eid, txt in list(evidence_map.items())[:8]:
+            menu = self._build_span_menu(txt, user_text, max_spans=14)
+            span_menus[eid] = menu
+            menu_lines = "\n".join([f"{i}: {json.dumps(sp, ensure_ascii=False)}" for i, sp in enumerate(menu)]) or "(empty)"
+            blocks.append(f"[{eid}]\nEXCERPT:\n{_ev_excerpt(txt, 900)}\n\nSPAN_MENU (cite by index):\n{menu_lines}")
+
+        sys = (
+            "You are a reasoning compiler. Output JSON only.\n"
+            "Goal: answer the user using atomic claims grounded in evidence.\n\n"
+            "Rules (hard):\n"
+            "- Output must be small: at most 3 claims.\n"
+            "- Each claim MUST cite exactly 1 evidence_id.\n"
+            "- Each claim MUST include 1 or 2 support_span_ids (integers).\n"
+            "- Each support_span_id MUST be a valid index into the cited evidence's SPAN_MENU.\n"
+            "- Keep draft under 200 characters.\n"
+            "- Every claim MUST include evidence_ids (existing IDs) AND support_span_ids.\n"
+            "- Output key order MUST be: claims, draft, proactive.\n"
+            "- Claim key order MUST be: text, evidence_ids, support_span_ids, kind.\n"
+            "- Do NOT introduce facts not supported by evidence.\n"
+            "- If evidence is insufficient, return claims=[] and draft='I don't know'.\n\n"
+            "- Set proactive=[] unless the user explicitly asked for suggestions.\n\n"
+            "Examples (illustrative only; do not copy placeholder IDs):\n"
+            "Evidence: [<EVID>] with SPAN_MENU indices.\n"
+            "Good claim: {\"text\":\"10/4 equals 2.5\",\"evidence_ids\":[\"<EVID>\"],\"support_span_ids\":[0,1],\"kind\":\"math\"}\n"
+            "Output JSON format:\n"
+            "{claims:[{text,evidence_ids,support_span_ids,kind}], draft:str, proactive:list}\n"
+        )
+        user = (
+            f"User question:\n{user_text}\n\n"
+            "Evidence you may cite:\n" + "\n".join(blocks) + "\n\n"
+            "Return JSON only."
+        )
+        msgs = [ChatMessage(role="system", content=sys), ChatMessage(role="user", content=user)]
+        raw = self.model.generate_json(msgs, self._Schema, temperature=0.2, max_tokens=1200)
+
+        claims: List[Claim] = []
+        for rc in raw.claims:
+            text = str(rc.text or "").strip()
+            eids = list(rc.evidence_ids or [])
+            span_ids = list(rc.support_span_ids or [])
+            if not (text and eids and span_ids):
+                continue
+            evid = str(eids[0])
+            menu = span_menus.get(evid) or []
+            spans: List[str] = []
+            ok = True
+            for sid in span_ids:
+                try:
+                    i = int(sid)
+                except Exception:
+                    ok = False
+                    break
+                if i < 0 or i >= len(menu):
+                    ok = False
+                    break
+                sp = menu[i]
+                # Safety: ensure it's actually in evidence (should always be true).
+                if sp and (sp in (evidence_map.get(evid, "") or "")):
+                    spans.append(sp)
+                else:
+                    ok = False
+                    break
+            if ok and spans:
+                claims.append(Claim(text=text, evidence_ids=[evid], support_spans=spans, kind=rc.kind))
+
+        return ProposedAnswer(claims=claims, draft=str(raw.draft or ""), proactive=list(raw.proactive or []))
+
+
+class SearchReasoner(Reasoner):
+    """
+    Best-of-N reasoning: sample multiple candidate claim sets and choose the one
+    that *appears most verifiable* against the provided evidence.
+
+    This is a practical approximation of "explore multiple reasoning paths"
+    (Tree-of-Thoughts style) without implementing a full tree search.
+    """
+
+    def __init__(self, base: LLMReasoner, samples: int = 4):
+        self.base = base
+        n = int(samples)
+        if n < 1:
+            raise ValueError("samples must be >= 1")
+        self.samples = n
+
+    @staticmethod
+    def _looks_supported(claim: Claim, evidence_map: Dict[str, str]) -> float:
+        # Evidence existence
+        ev_texts = [evidence_map.get(eid, "") for eid in claim.evidence_ids if eid in evidence_map]
+        if not ev_texts:
+            return 0.0
+
+        joined = "\n".join(ev_texts)
+
+        # Span hits (exact substring)
+        spans = list(claim.support_spans or [])
+        if not spans:
+            return 0.0
+        hit = sum(1 for sp in spans if sp and (sp in joined))
+        span_rate = hit / max(1, len(spans))
+
+        # Numeric grounding
+        nums = re.findall(r"-?\d+(?:\.\d+)?", claim.text or "")
+        num_ok = 1.0
+        if nums:
+            num_ok = 1.0 if all(n in joined for n in nums) else 0.0
+
+        # Token overlap (weak)
+        ct = set(toks(claim.text or ""))
+        et = set(toks(joined))
+        j = len(ct & et) / (len(ct | et) or 1)
+
+        return 0.70 * span_rate + 0.20 * num_ok + 0.10 * j
+
+    def propose(
+        self,
+        user_text: str,
+        *,
+        plan: Plan,
+        evidence_map: Dict[str, str],
+        memory_hits: Dict[str, Any],
+        tool_outcomes: List[ToolOutcome],
+    ) -> ProposedAnswer:
+        best: Optional[ProposedAnswer] = None
+        best_score = -1.0
+
+        for _ in range(self.samples):
+            cand = self.base.propose(
+                user_text,
+                plan=plan,
+                evidence_map=evidence_map,
+                memory_hits=memory_hits,
+                tool_outcomes=tool_outcomes,
+            )
+
+            # Score candidate by how supported its claims look.
+            if not cand.claims:
+                score = 0.0
+            else:
+                per = [self._looks_supported(c, evidence_map) for c in cand.claims]
+                score = sum(per) / max(1, len(per))
+
+            # Tie-breaker: more claims isn't always better, but it can be if supported.
+            score = score + 0.02 * len(cand.claims)
+
+            if score > best_score:
+                best_score = score
+                best = cand
+
+        return best or ProposedAnswer(claims=[], draft="I don't know.", proactive=[])
+
+
+
+---
+File: /cogos/renderer.py
+---
+
+from __future__ import annotations
+
+from typing import List
+
+from .ir import VerifiedAnswer
+from .memory import MemoryStore
+
+
+class Renderer:
+    def __init__(self, memory: MemoryStore):
+        self.memory = memory
+
+    def render(self, v: VerifiedAnswer) -> str:
+        if not v.ok:
+            suffix = ""
+            if v.warnings:
+                suffix = " (" + "; ".join(v.warnings) + ")"
+            return "I don’t know — I can’t verify any claims from evidence." + suffix
+
+        lines: List[str] = []
+        if v.warnings:
+            lines.append("⚠️ " + " ".join(v.warnings))
+        lines.append("Here’s what I can support from evidence:")
+        for c in v.claims:
+            lines.append(f"- {c.text}  [evidence: {', '.join(c.evidence_ids)}]")
+        return "\n".join(lines)
+
+
+
+
+---
+File: /cogos/tools.py
+---
+
+from __future__ import annotations
+
+import ast
+import datetime as dt
+import html
+import logging
+import math
+import re
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import OrderedDict
+import concurrent.futures as cf
+from dataclasses import dataclass, field
+from html.parser import HTMLParser
+from pathlib import Path
+from threading import Lock
+from typing import Any, Callable, ClassVar, Dict, List, Optional, Sequence
+
+from .event_bus import EventBus
+from .memory import MemoryStore
+from .pyd_compat import BaseModel, Field, ValidationError, _model_dump, _model_json_schema
+from .util import jdump, utc_ts
+
+logger = logging.getLogger(__name__)
+
+try:
+    # pydantic v2
+    from pydantic import field_validator as _field_validator  # type: ignore
+except Exception:  # pragma: no cover
+    _field_validator = None
+
+try:
+    # pydantic v1
+    from pydantic import validator as _validator  # type: ignore
+except Exception:  # pragma: no cover
+    _validator = None
+
+
+class ToolCall(BaseModel):
+    name: str
+    arguments: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolOutcome(BaseModel):
+    ok: bool
+    output: Dict[str, Any] = Field(default_factory=dict)
+    error: Optional[str] = None
+    evidence_id: Optional[str] = None
+    tool: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    """
+    Specification for a tool exposed to the agent runtime.
+
+    `default_trust_score` is written into evidence metadata for tool executions and must be a
+    finite float in the closed interval [0.0, 1.0].
+    """
+
+    name: str
+    description: str
+    input_model: type[BaseModel]
+    output_model: type[BaseModel]
+    handler: Callable[[BaseModel], BaseModel]
+    side_effects: bool = False
+    source_type: str = "tool_output"
+    # Conservative default: tool outputs are not treated as perfectly trustworthy by default.
+    default_trust_score: float = 0.8
+    evidence_metadata_builder: Optional[Callable[[BaseModel, BaseModel], Dict[str, Any]]] = None
+
+    def __post_init__(self) -> None:
+        # Validate trust score early so invalid specs are rejected at construction time.
+        try:
+            ts = float(self.default_trust_score)
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"ToolSpec.default_trust_score must be a number in [0.0, 1.0]; got {self.default_trust_score!r}"
+            ) from e
+
+        if not math.isfinite(ts) or ts < 0.0 or ts > 1.0:
+            raise ValueError(
+                f"ToolSpec.default_trust_score must be a finite number in [0.0, 1.0]; got {self.default_trust_score!r}"
+            )
+
+
+class ToolBus:
+    def __init__(self, memory: MemoryStore, event_bus: EventBus, *, allow_side_effects: bool = False):
+        self.memory = memory
+        self.bus = event_bus
+        self.allow_side_effects = allow_side_effects
+        self._tools: Dict[str, ToolSpec] = {}
+
+    def register(self, spec: ToolSpec) -> None:
+        if spec.name in self._tools:
+            raise ValueError(f"Tool already registered: {spec.name}")
+        self._tools[spec.name] = spec
+
+    def list_tools(self) -> List[Dict[str, Any]]:
+        out = []
+        for name in sorted(self._tools.keys()):
+            spec = self._tools[name]
+            out.append(
+                {
+                    "name": spec.name,
+                    "description": spec.description,
+                    "side_effects": spec.side_effects,
+                    "input_schema": _model_json_schema(spec.input_model),
+                    "output_schema": _model_json_schema(spec.output_model),
+                }
+            )
+        return out
+
+    def execute(self, call: ToolCall) -> ToolOutcome:
+        spec = self._tools.get(call.name)
+        if not spec:
+            return ToolOutcome(ok=False, error=f"Unknown tool: {call.name}", tool=call.name)
+        if spec.side_effects and not self.allow_side_effects:
+            return ToolOutcome(ok=False, error=f"Tool '{call.name}' is side-effectful and disabled.", tool=call.name)
+
+        try:
+            inp = spec.input_model(**call.arguments)
+        except ValidationError as e:
+            return ToolOutcome(ok=False, error=f"Invalid tool args: {e}", tool=call.name)
+
+        try:
+            out = spec.handler(inp)
+            # Validate output
+            out = spec.output_model(**_model_dump(out))
+        except Exception as e:
+            return ToolOutcome(ok=False, error=f"Tool error: {e}", tool=call.name)
+
+        evidence_metadata: Dict[str, Any] = {
+            "tool": call.name,
+            "args": call.arguments,
+            "source_type": spec.source_type,
+            "trust_score": float(spec.default_trust_score),
+        }
+        if spec.evidence_metadata_builder is not None:
+            try:
+                evidence_metadata.update(spec.evidence_metadata_builder(inp, out))
+            except Exception:
+                # Metadata is best-effort; never break tool execution.
+                logger.exception("evidence_metadata_builder failed for tool %s", call.name)
+
+        evid_id = self.memory.add_evidence(
+            kind=f"tool:{call.name}",
+            content=jdump(_model_dump(out)),
+            metadata=evidence_metadata,
+        )
+        self.bus.publish("tool_executed", {"tool": call.name, "call": _model_dump(call), "evidence_id": evid_id})
+        return ToolOutcome(ok=True, output=_model_dump(out), evidence_id=evid_id, tool=call.name)
+
+
+# ---- Built-in tools ----
+
+_ALLOWED_FUNCS: Dict[str, Any] = {
+    "sqrt": math.sqrt,
+    "log": math.log,
+    "log10": math.log10,
+    "exp": math.exp,
+    "sin": math.sin,
+    "cos": math.cos,
+    "tan": math.tan,
+    "pi": math.pi,
+    "e": math.e,
+    "abs": abs,
+    "round": round,
+}
+
+
+class CalcIn(BaseModel):
+    expression: str
+
+
+class CalcOut(BaseModel):
+    result: float
+    normalized_expression: str
+
+
+class _SafeEval(ast.NodeVisitor):
+    def visit(self, node):  # type: ignore[override]
+        if isinstance(node, ast.Expression):
+            return self.visit(node.body)
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (int, float)):
+                return float(node.value)
+            raise ValueError("Only numeric constants allowed.")
+        if isinstance(node, ast.BinOp):
+            a = self.visit(node.left)
+            b = self.visit(node.right)
+            if isinstance(node.op, ast.Add):
+                return a + b
+            if isinstance(node.op, ast.Sub):
+                return a - b
+            if isinstance(node.op, ast.Mult):
+                return a * b
+            if isinstance(node.op, ast.Div):
+                return a / b
+            if isinstance(node.op, ast.FloorDiv):
+                return a // b
+            if isinstance(node.op, ast.Mod):
+                return a % b
+            if isinstance(node.op, ast.Pow):
+                return a**b
+            raise ValueError("Operator not allowed.")
+        if isinstance(node, ast.UnaryOp):
+            v = self.visit(node.operand)
+            if isinstance(node.op, ast.UAdd):
+                return +v
+            if isinstance(node.op, ast.USub):
+                return -v
+            raise ValueError("Unary op not allowed.")
+        if isinstance(node, ast.Name):
+            if node.id in _ALLOWED_FUNCS and isinstance(_ALLOWED_FUNCS[node.id], (int, float)):
+                return float(_ALLOWED_FUNCS[node.id])
+            raise ValueError(f"Name not allowed: {node.id}")
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name):
+                raise ValueError("Only simple function calls allowed.")
+            fn = node.func.id
+            if fn not in _ALLOWED_FUNCS or not callable(_ALLOWED_FUNCS[fn]):
+                raise ValueError(f"Function not allowed: {fn}")
+            args = [self.visit(a) for a in node.args]
+            return float(_ALLOWED_FUNCS[fn](*args))
+        raise ValueError(f"Expression element not allowed: {type(node).__name__}")
+
+
+def calc_handler(inp: CalcIn) -> CalcOut:
+    expr = inp.expression.strip().replace("×", "*").replace("÷", "/").replace("^", "**")
+    tree = ast.parse(expr, mode="eval")
+    val = _SafeEval().visit(tree)
+    return CalcOut(result=float(val), normalized_expression=expr)
+
+
+class NowIn(BaseModel):
+    pass
+
+
+class NowOut(BaseModel):
+    iso: str
+    unix: float
+
+
+def now_handler(_: NowIn) -> NowOut:
+    now = dt.datetime.now().isoformat(timespec="seconds")
+    return NowOut(iso=now, unix=utc_ts())
+
+
+class MemSearchIn(BaseModel):
+    query: str
+    k: int = 5
+
+
+class MemSearchOut(BaseModel):
+    notes: List[Dict[str, Any]] = Field(default_factory=list)
+    evidence: List[Dict[str, Any]] = Field(default_factory=list)
+    skills: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+def make_mem_search_handler(mem: MemoryStore) -> Callable[[MemSearchIn], MemSearchOut]:
+    def _h(inp: MemSearchIn) -> MemSearchOut:
+        return MemSearchOut(
+            notes=mem.search_notes(inp.query, k=inp.k),
+            evidence=mem.search_evidence(inp.query, k=inp.k),
+            skills=mem.search_skills(inp.query, k=inp.k),
+        )
+
+    return _h
+
+
+class CountCharsIn(BaseModel):
+    text: str
+    char: str
+    case_sensitive: bool = True
+
+
+class CountCharsOut(BaseModel):
+    text: str
+    char: str
+    count: int
+    case_sensitive: bool
+
+
+def count_chars_handler(inp: CountCharsIn) -> CountCharsOut:
+    text = inp.text or ""
+    char = (inp.char or "")
+    if len(char) != 1:
+        raise ValueError("char must be a single character.")
+
+    haystack = text
+    needle = char
+    if not inp.case_sensitive:
+        haystack = haystack.lower()
+        needle = needle.lower()
+
+    return CountCharsOut(text=text, char=char, count=int(haystack.count(needle)), case_sensitive=bool(inp.case_sensitive))
+
+
+def _resolve_under_roots(path: str, roots: Sequence[str]) -> Path:
+    p = Path(path).expanduser().resolve()
+    for r in roots:
+        root = Path(r).expanduser().resolve()
+        try:
+            p.relative_to(root)
+            return p
+        except Exception:
+            continue
+    raise PermissionError(f"Path '{p}' is not under allowed roots: {list(roots)}")
+
+
+class ReadFileIn(BaseModel):
+    path: str
+    max_bytes: int = 250_000
+
+
+class ReadFileOut(BaseModel):
+    path: str
+    content: str
+    truncated: bool
+
+
+def make_read_file_handler(roots: Sequence[str]) -> Callable[[ReadFileIn], ReadFileOut]:
+    roots = list(roots)
+
+    def _h(inp: ReadFileIn) -> ReadFileOut:
+        p = _resolve_under_roots(inp.path, roots)
+        data = p.read_bytes()
+        truncated = False
+        if len(data) > inp.max_bytes:
+            data = data[: inp.max_bytes]
+            truncated = True
+        return ReadFileOut(path=str(p), content=data.decode("utf-8", errors="replace"), truncated=truncated)
+
+    return _h
+
+
+class WriteFileIn(BaseModel):
+    path: str
+    content: str
+    overwrite: bool = False
+
+
+class WriteFileOut(BaseModel):
+    path: str
+    bytes_written: int
+
+
+def make_write_file_handler(roots: Sequence[str]) -> Callable[[WriteFileIn], WriteFileOut]:
+    roots = list(roots)
+
+    def _h(inp: WriteFileIn) -> WriteFileOut:
+        p = _resolve_under_roots(inp.path, roots)
+        if p.exists() and not inp.overwrite:
+            raise FileExistsError(f"File exists: {p} (set overwrite=true)")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        data = inp.content.encode("utf-8")
+        p.write_bytes(data)
+        return WriteFileOut(path=str(p), bytes_written=len(data))
+
+    return _h
+
+
+# ---- Web search (best-effort, optional) ----
+
+
+class WebSearchIn(BaseModel):
+    query: str
+    k: int = 5
+    allow_domains: List[str] = Field(default_factory=list)
+    deny_domains: List[str] = Field(default_factory=list)
+    timeout_s: float = 8.0
+
+    # Public bounds (used both for validation and runtime clamping).
+    K_MIN: ClassVar[int] = 1
+    K_MAX: ClassVar[int] = 50
+    TIMEOUT_MIN: ClassVar[float] = 0.1
+    TIMEOUT_MAX: ClassVar[float] = 60.0
+
+    if _field_validator is not None:
+
+        @_field_validator("k", mode="before")
+        @classmethod
+        def _validate_k_v2(cls, v: Any) -> int:
+            if isinstance(v, bool):
+                raise ValueError(f"k must be between {cls.K_MIN} and {cls.K_MAX}")
+            try:
+                iv = int(v)
+            except Exception as e:  # noqa: BLE001
+                raise ValueError(f"k must be between {cls.K_MIN} and {cls.K_MAX}") from e
+            if iv < cls.K_MIN or iv > cls.K_MAX:
+                raise ValueError(f"k must be between {cls.K_MIN} and {cls.K_MAX}")
+            return iv
+
+        @_field_validator("timeout_s", mode="before")
+        @classmethod
+        def _validate_timeout_s_v2(cls, v: Any) -> float:
+            try:
+                fv = float(v)
+            except Exception as e:  # noqa: BLE001
+                raise ValueError(
+                    f"timeout_s must be between {cls.TIMEOUT_MIN:g} and {cls.TIMEOUT_MAX:g}"
+                ) from e
+            if not math.isfinite(fv) or fv < cls.TIMEOUT_MIN or fv > cls.TIMEOUT_MAX:
+                raise ValueError(f"timeout_s must be between {cls.TIMEOUT_MIN:g} and {cls.TIMEOUT_MAX:g}")
+            return fv
+
+    elif _validator is not None:
+
+        @_validator("k", pre=True)
+        def _validate_k_v1(cls, v: Any) -> int:
+            if isinstance(v, bool):
+                raise ValueError(f"k must be between {cls.K_MIN} and {cls.K_MAX}")
+            try:
+                iv = int(v)
+            except Exception as e:  # noqa: BLE001
+                raise ValueError(f"k must be between {cls.K_MIN} and {cls.K_MAX}") from e
+            if iv < cls.K_MIN or iv > cls.K_MAX:
+                raise ValueError(f"k must be between {cls.K_MIN} and {cls.K_MAX}")
+            return iv
+
+        @_validator("timeout_s", pre=True)
+        def _validate_timeout_s_v1(cls, v: Any) -> float:
+            try:
+                fv = float(v)
+            except Exception as e:  # noqa: BLE001
+                raise ValueError(
+                    f"timeout_s must be between {cls.TIMEOUT_MIN:g} and {cls.TIMEOUT_MAX:g}"
+                ) from e
+            if not math.isfinite(fv) or fv < cls.TIMEOUT_MIN or fv > cls.TIMEOUT_MAX:
+                raise ValueError(f"timeout_s must be between {cls.TIMEOUT_MIN:g} and {cls.TIMEOUT_MAX:g}")
+            return fv
+
+    else:  # pragma: no cover
+        # If pydantic validators aren't available (e.g., during lightweight/static analysis),
+        # skip validation rather than failing at import time.
+        pass
+
+
+class WebSearchResult(BaseModel):
+    title: str
+    url: str
+    snippet: str = ""
+    domain: str = ""
+    rank: int = 0
+    trust_score: float = 0.35
+
+
+class WebSearchOut(BaseModel):
+    query: str
+    provider: str
+    results: List[WebSearchResult] = Field(default_factory=list)
+
+
+def _strip_html(s: str) -> str:
+    if not s:
+        return ""
+
+    class _TextOnlyHTMLParser(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__()
+            self._chunks: List[str] = []
+
+        def handle_data(self, data: str) -> None:  # pyright: ignore[reportImplicitOverride]
+            if data:
+                self._chunks.append(data)
+
+        def text(self) -> str:
+            # Join chunks with spaces to preserve word boundaries across tags,
+            # then normalize whitespace downstream.
+            return " ".join(self._chunks)
+
+    try:
+        p = _TextOnlyHTMLParser()
+        p.feed(s)
+        p.close()
+        out = p.text()
+    except Exception:  # noqa: BLE001
+        # Best-effort fallback to previous regex behavior.
+        out = re.sub(r"<[^>]+>", " ", s)
+
+    out = html.unescape(out)
+    out = re.sub(r"\s+", " ", out).strip()
+    return out
+
+
+def _normalize_domain(d: str) -> str:
+    d = (d or "").strip().lower()
+    if d.startswith("www."):
+        d = d[4:]
+    return d
+
+
+def _domain_matches(domain: str, suffix: str) -> bool:
+    domain = _normalize_domain(domain)
+    suffix = _normalize_domain(suffix)
+    if not suffix:
+        return False
+    return domain == suffix or domain.endswith("." + suffix)
+
+
+def _domain_allowed(domain: str, allow: Sequence[str], deny: Sequence[str]) -> bool:
+    domain = _normalize_domain(domain)
+    if any(_domain_matches(domain, d) for d in deny if d):
+        return False
+    allow_clean = [a for a in allow if a]
+    if not allow_clean:
+        return True
+    return any(_domain_matches(domain, a) for a in allow_clean)
+
+
+_DEFAULT_DOMAIN_TRUST: Dict[str, float] = {
+    "wikipedia.org": 0.9,
+    "arxiv.org": 0.85,
+    "github.com": 0.75,
+    "docs.python.org": 0.85,
+    "developer.mozilla.org": 0.85,
+}
+
+
+def _trust_for_domain(domain: str, allow: Sequence[str]) -> float:
+    d = _normalize_domain(domain)
+    for suf, score in _DEFAULT_DOMAIN_TRUST.items():
+        if _domain_matches(d, suf):
+            return float(score)
+    # Light heuristics
+    if d.endswith(".gov") or d.endswith(".gov.uk") or d.endswith(".gov.au"):
+        return 0.8
+    if d.endswith(".edu"):
+        return 0.75
+    if any(_domain_matches(d, a) for a in allow if a):
+        return 0.6
+    return 0.35
+
+
+def _ddg_unwrap_url(href: str) -> str:
+    href = (href or "").strip()
+    if not href:
+        return ""
+    if href.startswith("//"):
+        href = "https:" + href
+    if href.startswith("/l/?") or href.startswith("/l/"):
+        parsed = urllib.parse.urlparse("https://duckduckgo.com" + href)
+        qs = urllib.parse.parse_qs(parsed.query)
+        if "uddg" in qs and qs["uddg"]:
+            try:
+                return urllib.parse.unquote(qs["uddg"][0])
+            except Exception:
+                return qs["uddg"][0]
+    if href.startswith("/"):
+        return "https://duckduckgo.com" + href
+    return href
+
+
+def _duckduckgo_lite_search(
+    query: str,
+    *,
+    k: int,
+    timeout_s: float,
+    raise_on_error: bool = False,
+) -> List[Dict[str, str]]:
+    """
+    Best-effort DuckDuckGo Lite HTML scraping.
+
+    Note: This helper is intentionally simple; production safeguards (caching, backoff,
+    circuit breaker, metrics) are implemented in `make_web_search_handler`.
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    url = "https://lite.duckduckgo.com/lite/?" + urllib.parse.urlencode({"q": q})
+    req = urllib.request.Request(url, headers={"User-Agent": "CogOS/1.0 (+local)"})
+    try:
+        with urllib.request.urlopen(req, timeout=float(timeout_s)) as resp:
+            data = resp.read()
+    except (urllib.error.URLError, urllib.error.HTTPError) as e:
+        if raise_on_error:
+            raise
+        logger.warning("DuckDuckGo search request failed: %s", e)
+        return []
+    except Exception as e:
+        if raise_on_error:
+            raise
+        logger.error("Unexpected error in web search: %s", e)
+        return []
+    page = data.decode("utf-8", errors="replace")
+
+    # Try to extract results from either lite or html layouts (best-effort).
+    link_pats = [
+        re.compile(r'<a[^>]+class="result-link"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', re.I | re.S),
+        re.compile(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', re.I | re.S),
+    ]
+    snip_pats = [
+        re.compile(r'<td[^>]+class="result-snippet"[^>]*>(.*?)</td>', re.I | re.S),
+        re.compile(r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>', re.I | re.S),
+        re.compile(r'<div[^>]+class="result__snippet"[^>]*>(.*?)</div>', re.I | re.S),
+    ]
+
+    matches = []
+    for p in link_pats:
+        matches = list(p.finditer(page))
+        if matches:
+            break
+    if not matches:
+        return []
+
+    out: List[Dict[str, str]] = []
+    for i, m in enumerate(matches):
+        href = _ddg_unwrap_url(m.group(1))
+        title = _strip_html(m.group(2))
+        if not href or not title:
+            continue
+        # Find a snippet near this link.
+        end = matches[i + 1].start() if i + 1 < len(matches) else min(len(page), m.end() + 6000)
+        window = page[m.end() : end]
+        snippet = ""
+        for sp in snip_pats:
+            sm = sp.search(window)
+            if sm:
+                snippet = _strip_html(sm.group(1))
+                break
+        out.append({"title": title, "url": href, "snippet": snippet})
+        if len(out) >= int(k):
+            break
+    return out
+
+
+def make_web_search_handler(
+    *,
+    allow_domains: Sequence[str] = (),
+    deny_domains: Sequence[str] = (),
+    provider: str = "duckduckgo_lite",
+    # Production safeguards (defaults are conservative and backwards-compatible)
+    cache_ttl_s: float = 300.0,
+    cache_max_entries: int = 256,
+    enable_cache: bool = True,
+    rate_limit_window_s: float = 60.0,
+    rate_limit_max_calls: int = 60,
+    enable_rate_limit: bool = True,
+    max_retries: int = 2,
+    backoff_base_s: float = 0.25,
+    backoff_max_s: float = 2.0,
+    enable_backoff: bool = True,
+    circuit_breaker_failure_threshold: int = 5,
+    circuit_breaker_open_s: float = 30.0,
+    enable_circuit_breaker: bool = True,
+) -> Callable[[WebSearchIn], WebSearchOut]:
+    allow = [str(d).strip().lower() for d in allow_domains if str(d).strip()]
+    deny = [str(d).strip().lower() for d in deny_domains if str(d).strip()]
+
+    def _normalize_query(q: str) -> str:
+        q = (q or "").strip()
+        q = re.sub(r"\s+", " ", q)
+        return q
+
+    def _norm_domains(ds: Sequence[str]) -> tuple[str, ...]:
+        return tuple(sorted({_normalize_domain(str(d)) for d in (ds or []) if str(d).strip()}))
+
+    def _cache_key(*, q: str, allow_eff: Sequence[str], deny_eff: Sequence[str], k: int, provider_name: str) -> str:
+        # Keyed by normalized query + allow/deny + provider (plus k to avoid returning more than asked).
+        aq = _normalize_query(q).lower()
+        a = ",".join(_norm_domains(allow_eff))
+        d = ",".join(_norm_domains(deny_eff))
+        return f"v1|p={provider_name}|k={int(k)}|q={aq}|allow={a}|deny={d}"
+
+    class _TTLCache:
+        ttl_s: float
+        max_entries: int
+        _data: OrderedDict[str, tuple[float, WebSearchOut]]
+        _lock: Lock
+
+        def __init__(self, *, ttl_s: float, max_entries: int) -> None:
+            self.ttl_s = float(ttl_s)
+            self.max_entries = int(max_entries)
+            self._data = OrderedDict()
+            self._lock = Lock()
+
+        def get(self, key: str) -> WebSearchOut | None:
+            if self.ttl_s <= 0 or self.max_entries <= 0:
+                return None
+            now = time.monotonic()
+            with self._lock:
+                item = self._data.get(key)
+                if not item:
+                    return None
+                exp, val = item
+                if exp <= now:
+                    # Expired
+                    _ = self._data.pop(key, None)
+                    return None
+                # LRU touch
+                self._data.move_to_end(key, last=True)
+                return val
+
+        def set(self, key: str, val: WebSearchOut) -> None:
+            if self.ttl_s <= 0 or self.max_entries <= 0:
+                return
+            now = time.monotonic()
+            exp = now + self.ttl_s
+            with self._lock:
+                self._data[key] = (exp, val)
+                self._data.move_to_end(key, last=True)
+                # Trim
+                while len(self._data) > self.max_entries:
+                    _ = self._data.popitem(last=False)
+
+    class _FixedWindowLimiter:
+        window_s: float
+        max_calls: int
+        _lock: Lock
+        _window_start: float
+        _count: int
+
+        def __init__(self, *, window_s: float, max_calls: int) -> None:
+            self.window_s = max(0.0, float(window_s))
+            self.max_calls = max(0, int(max_calls))
+            self._lock = Lock()
+            self._window_start = 0.0
+            self._count = 0
+
+        def acquire(self) -> float:
+            """
+            Returns wait seconds (0 = allowed immediately).
+            """
+            if self.window_s <= 0 or self.max_calls <= 0:
+                return 0.0
+            now = time.monotonic()
+            with self._lock:
+                if self._window_start <= 0.0 or (now - self._window_start) >= self.window_s:
+                    self._window_start = now
+                    self._count = 0
+                if self._count < self.max_calls:
+                    self._count += 1
+                    return 0.0
+                return max(0.0, self.window_s - (now - self._window_start))
+
+    class _CircuitBreaker:
+        failure_threshold: int
+        open_s: float
+        _lock: Lock
+        _failures: int
+        _open_until: float
+        _half_open_in_flight: bool
+
+        def __init__(self, *, failure_threshold: int, open_s: float) -> None:
+            self.failure_threshold = max(1, int(failure_threshold))
+            self.open_s = max(0.0, float(open_s))
+            self._lock = Lock()
+            self._failures = 0
+            self._open_until = 0.0
+            self._half_open_in_flight = False
+
+        def allow(self) -> bool:
+            if self.open_s <= 0:
+                return True
+            now = time.monotonic()
+            with self._lock:
+                if now < self._open_until:
+                    return False
+                # Half-open: allow a single probe at a time.
+                if self._open_until > 0.0 and not self._half_open_in_flight:
+                    self._half_open_in_flight = True
+                    return True
+                if self._open_until > 0.0 and self._half_open_in_flight:
+                    return False
+                return True
+
+        def on_success(self) -> None:
+            with self._lock:
+                self._failures = 0
+                self._open_until = 0.0
+                self._half_open_in_flight = False
+
+        def on_failure(self) -> None:
+            if self.open_s <= 0:
+                return
+            now = time.monotonic()
+            with self._lock:
+                self._failures += 1
+                self._half_open_in_flight = False
+                if self._failures >= self.failure_threshold:
+                    self._open_until = now + self.open_s
+
+    @dataclass
+    class _Metrics:
+        calls: int = 0
+        success: int = 0
+        failure: int = 0
+        cache_hit: int = 0
+        rate_limited: int = 0
+        circuit_open: int = 0
+        # latency histogram buckets (seconds)
+        hist_le_0_1: int = 0
+        hist_le_0_3: int = 0
+        hist_le_1: int = 0
+        hist_le_3: int = 0
+        hist_le_8: int = 0
+        hist_le_20: int = 0
+        hist_gt_20: int = 0
+
+        lock: Lock = field(default_factory=Lock, repr=False)
+
+        def observe_latency(self, s: float) -> None:
+            with self.lock:
+                if s <= 0.1:
+                    self.hist_le_0_1 += 1
+                elif s <= 0.3:
+                    self.hist_le_0_3 += 1
+                elif s <= 1.0:
+                    self.hist_le_1 += 1
+                elif s <= 3.0:
+                    self.hist_le_3 += 1
+                elif s <= 8.0:
+                    self.hist_le_8 += 1
+                elif s <= 20.0:
+                    self.hist_le_20 += 1
+                else:
+                    self.hist_gt_20 += 1
+
+    _cache = _TTLCache(ttl_s=float(cache_ttl_s), max_entries=int(cache_max_entries))
+    _limiter = _FixedWindowLimiter(window_s=float(rate_limit_window_s), max_calls=int(rate_limit_max_calls))
+    _breaker = _CircuitBreaker(
+        failure_threshold=int(circuit_breaker_failure_threshold),
+        open_s=float(circuit_breaker_open_s),
+    )
+    _metrics = _Metrics()
+    # Dedicated, small pool so web fetches don't monopolize any shared executor.
+    _net_pool = cf.ThreadPoolExecutor(max_workers=4, thread_name_prefix="cogos-websearch")
+
+    def _fetch_raw_ddg(query: str, *, k: int, timeout_s: float) -> list[dict[str, str]]:
+        # Run in worker thread; enforce an overall timeout so we can trip the circuit breaker on hangs.
+        fut: cf.Future[list[dict[str, str]]] = _net_pool.submit(
+            _duckduckgo_lite_search,
+            query,
+            k=k,
+            timeout_s=timeout_s,
+            raise_on_error=True,
+        )
+        return fut.result(timeout=float(timeout_s) + 2.0)
+
+    def _is_retryable_http(e: BaseException) -> bool:
+        if isinstance(e, urllib.error.HTTPError) and getattr(e, "code", None) == 429:
+            return True
+        # URLError is too broad; treat explicit timeout-y errors as retryable.
+        if isinstance(e, (TimeoutError, cf.TimeoutError)):
+            return True
+        # socket.timeout is a TimeoutError subclass, but keep explicit check defensive.
+        if e.__class__.__name__ == "timeout":
+            return True
+        return False
+
+    def _backoff_sleep_s(attempt: int) -> float:
+        base = max(0.0, float(backoff_base_s))
+        cap = max(base, float(backoff_max_s))
+        # Exponential backoff with a small deterministic jitter derived from attempt.
+        s = min(cap, base * (2.0**attempt))
+        jitter = min(0.05, 0.01 * (attempt + 1))
+        return max(0.0, s + jitter)
+
+    def _h(inp: WebSearchIn) -> WebSearchOut:
+        k = max(WebSearchIn.K_MIN, min(WebSearchIn.K_MAX, int(inp.k)))
+        timeout_s = max(WebSearchIn.TIMEOUT_MIN, min(WebSearchIn.TIMEOUT_MAX, float(inp.timeout_s)))
+        # Enforce config allow/deny; tool args can only further restrict.
+        allow_eff = allow
+        if inp.allow_domains:
+            tool_allow = [str(d).strip().lower() for d in (inp.allow_domains or []) if str(d).strip()]
+            if allow_eff:
+                allow_eff = [
+                    d for d in allow_eff if any(_domain_matches(d, a) or _domain_matches(a, d) for a in tool_allow)
+                ]
+            else:
+                # If config didn't specify an allowlist, allow the tool to restrict.
+                allow_eff = tool_allow
+        deny_eff = sorted({*deny, *[str(d).strip().lower() for d in (inp.deny_domains or []) if str(d).strip()]})
+
+        provider_name = str(provider)
+        q_norm = _normalize_query(inp.query)
+        ck = _cache_key(q=q_norm, allow_eff=allow_eff, deny_eff=deny_eff, k=k, provider_name=provider_name)
+
+        if enable_cache:
+            cached = _cache.get(ck)
+            if cached is not None:
+                with _metrics.lock:
+                    _metrics.cache_hit += 1
+                logger.debug("web_search cache_hit provider=%s query=%r", provider_name, q_norm)
+                return cached
+
+        with _metrics.lock:
+            _metrics.calls += 1
+            calls_n = _metrics.calls
+
+        if enable_circuit_breaker and not _breaker.allow():
+            with _metrics.lock:
+                _metrics.circuit_open += 1
+                _metrics.failure += 1
+            logger.debug("web_search circuit_open provider=%s query=%r", provider_name, q_norm)
+            out = WebSearchOut(query=inp.query, provider=provider_name, results=[])
+            if enable_cache:
+                # Cache the "fast-fail" briefly to reduce stampede when provider is down.
+                _cache.set(ck, out)
+            return out
+
+        if enable_rate_limit:
+            wait_s = _limiter.acquire()
+            if wait_s > 0:
+                with _metrics.lock:
+                    _metrics.rate_limited += 1
+                logger.debug("web_search rate_limited provider=%s wait_s=%.3f", provider_name, wait_s)
+                # Keep wait bounded; we prefer returning quickly to avoid tying up tool execution.
+                time.sleep(min(wait_s, 0.5))
+
+        t0 = time.perf_counter()
+        raw: list[dict[str, str]] = []
+        ok = False
+        last_err: BaseException | None = None
+        for attempt in range(0, max(0, int(max_retries)) + 1):
+            try:
+                if provider_name == "duckduckgo_lite":
+                    raw = _fetch_raw_ddg(q_norm, k=k * 3, timeout_s=timeout_s)
+                else:
+                    # Fallback: preserve previous behavior for unknown providers.
+                    raw = _duckduckgo_lite_search(q_norm, k=k * 3, timeout_s=timeout_s)
+                ok = True
+                last_err = None
+                break
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                if enable_backoff and attempt < int(max_retries) and _is_retryable_http(e):
+                    time.sleep(_backoff_sleep_s(attempt))
+                    continue
+                break
+
+        dt_s = time.perf_counter() - t0
+        _metrics.observe_latency(dt_s)
+
+        if ok:
+            if enable_circuit_breaker:
+                _breaker.on_success()
+            with _metrics.lock:
+                _metrics.success += 1
+        else:
+            if enable_circuit_breaker:
+                _breaker.on_failure()
+            with _metrics.lock:
+                _metrics.failure += 1
+            # Preserve prior behavior: errors just yield empty results.
+            raw = []
+
+        results: List[WebSearchResult] = []
+        for r in raw:
+            url = str(r.get("url") or "").strip()
+            if not url:
+                continue
+            domain = _normalize_domain(urllib.parse.urlparse(url).netloc)
+            if not _domain_allowed(domain, allow_eff, deny_eff):
+                continue
+            trust = _trust_for_domain(domain, allow_eff)
+            results.append(
+                WebSearchResult(
+                    title=str(r.get("title") or "").strip(),
+                    url=url,
+                    snippet=str(r.get("snippet") or "").strip(),
+                    domain=domain,
+                    rank=len(results) + 1,
+                    trust_score=float(trust),
+                )
+            )
+            if len(results) >= k:
+                break
+        out = WebSearchOut(query=inp.query, provider=provider_name, results=results)
+        if enable_cache:
+            _cache.set(ck, out)
+        logger.debug(
+            "web_search call provider=%s ok=%s latency_s=%.3f results=%d",
+            provider_name,
+            ok,
+            dt_s,
+            len(out.results),
+        )
+        # Periodic snapshot for log-based monitoring (best-effort; avoids per-call spam at INFO).
+        if calls_n % 50 == 0:
+            with _metrics.lock:
+                snap = {
+                    "calls": _metrics.calls,
+                    "success": _metrics.success,
+                    "failure": _metrics.failure,
+                    "cache_hit": _metrics.cache_hit,
+                    "rate_limited": _metrics.rate_limited,
+                    "circuit_open": _metrics.circuit_open,
+                    "hist_le_0_1": _metrics.hist_le_0_1,
+                    "hist_le_0_3": _metrics.hist_le_0_3,
+                    "hist_le_1": _metrics.hist_le_1,
+                    "hist_le_3": _metrics.hist_le_3,
+                    "hist_le_8": _metrics.hist_le_8,
+                    "hist_le_20": _metrics.hist_le_20,
+                    "hist_gt_20": _metrics.hist_gt_20,
+                }
+            logger.info("web_search metrics provider=%s %s", provider_name, snap)
+
+        # Emit a warning on hard failures for visibility.
+        if (not ok) and last_err is not None:
+            logger.warning(
+                "web_search provider=%s failed query=%r err=%s latency_s=%.3f",
+                provider_name,
+                q_norm,
+                repr(last_err),
+                dt_s,
+            )
+        return out
+
+    return _h
+
+
+
+---
+File: /cogos/util.py
+---
+
+from __future__ import annotations
+
+import json
+import re
+import time
+import uuid
+from typing import Any, Dict, List, Optional
+
+
+def utc_ts() -> float:
+    return time.time()
+
+
+def new_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+def jdump(x: Any) -> str:
+    return json.dumps(x, ensure_ascii=False, sort_keys=True)
+
+
+def jload(s: Optional[str]) -> Any:
+    if not s:
+        return None
+    return json.loads(s)
+
+
+def short(s: str, n: int = 200) -> str:
+    s = (s or "").strip().replace("\n", " ")
+    return s if len(s) <= n else (s[: n - 1] + "…")
+
+
+def toks(s: str) -> List[str]:
+    return re.findall(r"[a-z0-9_]+", (s or "").lower())
+
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def extract_first_json_object(text: str) -> Dict[str, Any]:
+    """
+    Extract the first JSON object from arbitrary text by scanning balanced braces.
+
+    This is intentionally conservative. If it can't parse safely, it raises ValueError.
+    """
+    s = text.strip()
+    # Fast path: direct parse
+    try:
+        if s.startswith("{") and s.endswith("}"):
+            return json.loads(s)
+    except Exception:
+        pass
+
+    start = s.find("{")
+    if start < 0:
+        raise ValueError(f"No JSON object found. Output snippet: {short(s, 400)}")
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        else:
+            if ch == '"':
+                in_str = True
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    chunk = s[start : i + 1]
+                    return json.loads(chunk)
+    raise ValueError(f"Unbalanced JSON braces. Output snippet: {short(s, 400)}")
+
+
+
+---
+File: /cogos/verifier.py
+---
+
+from __future__ import annotations
+
+import re
+from typing import Dict, List, Optional
+
+from .ir import Claim, ProposedAnswer, VerifiedAnswer
+from .memory import MemoryStore
+from .util import toks
+
+
+class Verifier:
+    """
+    Enforces "no unsupported claims":
+    - Evidence IDs must exist.
+    - Support spans must appear verbatim in evidence texts.
+    - If claim text contains numbers, those numbers must appear in evidence.
+    """
+
+    def __init__(
+        self,
+        memory: MemoryStore,
+        *,
+        require_spans: bool = True,
+        min_span_hits: float = 0.5,
+        min_trust_score: float = 0.0,
+    ):
+        self.memory = memory
+        self.require_spans = require_spans
+        self.min_span_hits = float(min_span_hits)
+        self.min_trust_score = float(min_trust_score)
+
+    def _ev_text(self, evid: str) -> Optional[str]:
+        ev = self.memory.get_evidence(evid)
+        if not ev:
+            return None
+        try:
+            trust = float((ev.get("metadata") or {}).get("trust_score", 1.0))
+        except Exception:
+            trust = 1.0
+        if trust < self.min_trust_score:
+            return None
+        return ev["content"] or ""
+
+    @staticmethod
+    def _numbers(s: str) -> List[str]:
+        return re.findall(r"-?\d+(?:\.\d+)?", s)
+
+    def verify_claim(self, c: Claim) -> Claim:
+        # Evidence existence
+        ev_texts: Dict[str, str] = {}
+        for evid in c.evidence_ids:
+            t = self._ev_text(evid)
+            if t is not None:
+                ev_texts[evid] = t
+        if not ev_texts:
+            return (
+                c.model_copy(update={"status": "rejected", "score": 0.0})
+                if hasattr(c, "model_copy")
+                else c.copy(update={"status": "rejected", "score": 0.0})
+            )  # type: ignore
+
+        # Support spans
+        spans = list(c.support_spans or [])
+        if self.require_spans and not spans:
+            return (
+                c.model_copy(update={"status": "rejected", "score": 0.0})
+                if hasattr(c, "model_copy")
+                else c.copy(update={"status": "rejected", "score": 0.0})
+            )  # type: ignore
+
+        hit = 0
+        for sp in spans:
+            found = any(sp in txt for txt in ev_texts.values())
+            if found:
+                hit += 1
+        span_hit_rate = hit / max(1, len(spans))
+
+        # Numeric grounding
+        nums = self._numbers(c.text)
+        num_ok = True
+        if nums:
+            joined = "\n".join(ev_texts.values())
+            for n in nums:
+                if n not in joined:
+                    num_ok = False
+                    break
+
+        # Token overlap (weak secondary signal)
+        ct = set(toks(c.text))
+        et = set(toks("\n".join(ev_texts.values())))
+        j = len(ct & et) / (len(ct | et) or 1)
+
+        # Score and decision
+        score = 0.65 * span_hit_rate + 0.20 * (1.0 if num_ok else 0.0) + 0.15 * j
+        ok = (span_hit_rate >= self.min_span_hits) and num_ok
+
+        status = "verified" if ok else "rejected"
+        updated = {"status": status, "score": float(score)}
+        if hasattr(c, "model_copy"):
+            return c.model_copy(update=updated)
+        return c.copy(update=updated)  # type: ignore
+
+    def verify(self, p: ProposedAnswer) -> VerifiedAnswer:
+        verified: List[Claim] = []
+        rejected = 0
+        for c in p.claims:
+            vc = self.verify_claim(c)
+            if vc.status == "verified":
+                verified.append(vc)
+            else:
+                rejected += 1
+
+        warns: List[str] = []
+        if rejected:
+            warns.append(f"Rejected {rejected} unsupported claim(s).")
+        if not verified:
+            return VerifiedAnswer(ok=False, claims=[], response="", warnings=warns + ["No verified claims. Abstaining."])
+        return VerifiedAnswer(ok=True, claims=verified, response="", warnings=warns)
+
+
+
+
+---
+File: /cogos.py
+---
+
+"""
+CogOS — Production-Grade Baseline (module-based implementation)
+
+Entry point wrapper. See the `cogos/` package for the implementation.
+"""
+
+from __future__ import annotations
+
+from cogos.cli import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+

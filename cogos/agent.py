@@ -6,6 +6,7 @@ and renderer into a single `CogOS` façade.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, cast, final
 
@@ -20,7 +21,7 @@ from .daemons import (
     TaskSolverDaemon,
 )
 from .embeddings import EmbeddingModel, HashEmbed, SentenceTransformerEmbed
-from .event_bus import EventBus
+from .event_bus import Event, EventBus
 from .initiative import InitiativeManager
 from .llm import ChatModel, LlamaCppChatModel, OllamaChatModel, StubChatModel
 from .logging_utils import log, setup_logging
@@ -58,7 +59,7 @@ from .tools import (
     make_write_file_handler,
     now_handler,
 )
-from .util import jdump
+from .util import jdump, toks
 from .verifier import Verifier
 
 from .ir import Plan, StepCreateTask, StepMemorySearch, StepToolCall, StepWriteNote
@@ -95,7 +96,9 @@ class AgentConfig:
     allow_side_effects: bool = False
     allow_web_search: bool = False
     auto_research: bool = False
-    web_allow_domains: tuple[str, ...] = ("wikipedia.org", "arxiv.org", "github.com")
+    # Default: no allowlist (permit any domain), but downstream trust scoring + verifier thresholds
+    # still gate what can be used as evidence.
+    web_allow_domains: tuple[str, ...] = ()
     web_deny_domains: tuple[str, ...] = ()
     # Default: reject low-trust evidence such as conversation-derived notes.
     # Web allowlisted domains typically score >= 0.6; conversation fragments cap at ~0.35.
@@ -112,6 +115,10 @@ class AgentConfig:
     background: bool = True
     json_logs: bool = False
     log_level: str = "INFO"
+    log_file: str = "cogos.log"
+    log_file_level: str = "DEBUG"
+    log_file_max_bytes: int = 10_000_000
+    log_file_backup_count: int = 3
     initiative_threshold: float = 0.62
 
 
@@ -121,7 +128,14 @@ class CogOS:
 
     def __init__(self, cfg: AgentConfig):
         self.cfg = cfg
-        setup_logging(cfg.log_level, json_logs=cfg.json_logs)
+        setup_logging(
+            cfg.log_level,
+            json_logs=cfg.json_logs,
+            log_file=cfg.log_file,
+            log_file_level=cfg.log_file_level,
+            log_file_max_bytes=cfg.log_file_max_bytes,
+            log_file_backup_count=cfg.log_file_backup_count,
+        )
         self.last_trace: dict[str, Any] | None = None
 
         # embedder
@@ -131,6 +145,18 @@ class CogOS:
             embedder = HashEmbed(384)
 
         self.bus = EventBus()
+        self._recent_bus_events: "deque[JsonObject]" = deque(maxlen=200)
+
+        def _record_bus_event(evt: Event) -> None:
+            try:
+                # Store a compact record; payload can be inspected via /show events live if needed.
+                self._recent_bus_events.append(
+                    {"type": str(evt.type), "ts": float(evt.ts), "payload": cast(JsonObject, dict(evt.payload))}
+                )
+            except Exception:  # pylint: disable=broad-exception-caught
+                return
+
+        self.bus.add_listener(_record_bus_event)
         self.memory = MemoryStore(cfg.db, embedder=embedder)
 
         self.tools = ToolBus(self.memory, self.bus, allow_side_effects=cfg.allow_side_effects)
@@ -183,11 +209,11 @@ class CogOS:
             # auto: try llama.cpp first, then Ollama, otherwise fail with a helpful error.
             try:
                 self.llm = _try_llama_cpp()
-            except Exception as e1:  # noqa: BLE001
+            except Exception as e1:  # pylint: disable=broad-exception-caught
                 llm_errs.append(f"llama_cpp: {type(e1).__name__}: {e1}")
                 try:
                     self.llm = _try_ollama()
-                except Exception as e2:  # noqa: BLE001
+                except Exception as e2:  # pylint: disable=broad-exception-caught
                     llm_errs.append(f"ollama: {type(e2).__name__}: {e2}")
                     raise RuntimeError(
                         "No usable LLM backend found.\n\n"
@@ -407,6 +433,7 @@ class CogOS:
                     lambda m: make_web_search_handler(
                         allow_domains=self.cfg.web_allow_domains,
                         deny_domains=self.cfg.web_deny_domains,
+                        min_result_trust=self.cfg.min_evidence_trust,  # pylint: disable=unexpected-keyword-arg
                     )(cast(WebSearchIn, m)),
                     side_effects=False,
                     source_type="web_search",
@@ -423,12 +450,31 @@ class CogOS:
     ) -> tuple[str, list[JsonObject]]:
         """Handle a single user turn and return `(response, proactive_items)`."""
 
+        trace_events: list[JsonObject] = []
+        bus_turn_events: list[JsonObject] = []
+
+        def _record_turn_bus_event(evt: Event) -> None:
+            try:
+                bus_turn_events.append(
+                    {"type": str(evt.type), "ts": float(evt.ts), "payload": cast(JsonObject, dict(evt.payload))}
+                )
+            except Exception:  # pylint: disable=broad-exception-caught
+                return
+
+        # Capture events that happen during this turn (daemons may also emit shortly after).
+        self.bus.add_listener(_record_turn_bus_event)
+
         def _trace(kind: str, payload: JsonObject) -> None:
+            try:
+                trace_events.append({"kind": str(kind), "payload": payload})
+            except Exception:  # pylint: disable=broad-exception-caught
+                # Tracing is best-effort.
+                pass
             if on_trace is None:
                 return
             try:
                 on_trace(kind, payload)
-            except Exception:
+            except Exception:  # pylint: disable=broad-exception-caught
                 # Trace hooks are best-effort; never break the agent loop.
                 return
 
@@ -456,6 +502,87 @@ class CogOS:
                     if isinstance(ts, (int, float)):
                         best = max(best, float(ts))
             return float(best)
+
+        def _max_hit_relevance(hits: JsonObject, query: str) -> float:
+            """
+            Heuristic: maximum token overlap between the query and any returned hit snippet/title.
+            """
+            q = str(query or "")
+            qt = set(toks(q))
+            if not qt:
+                return 0.0
+
+            def overlap(s: str) -> float:
+                st = set(toks(s))
+                if not st:
+                    return 0.0
+                return len(st & qt) / (len(st | qt) or 1)
+
+            best = 0.0
+            for k in ("notes", "evidence", "skills"):
+                items = hits.get(k) or []
+                if not isinstance(items, list):
+                    continue
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    # Common fields across our hit shapes.
+                    parts: list[str] = []
+                    for f in ("title", "name", "kind", "domain", "content_snip", "snippet", "source_type"):
+                        v = it.get(f, "")
+                        if isinstance(v, str) and v:
+                            parts.append(v)
+                    if parts:
+                        best = max(best, max(overlap(p) for p in parts))
+            return float(best)
+
+        def _eligible_hit_count(hits: JsonObject, query: str) -> int:
+            """
+            Count hits that are both relevant and trusted enough to avoid web_search.
+            """
+            min_trust = float(self.cfg.min_evidence_trust)
+            qt = set(toks(str(query or "")))
+            if not qt:
+                return 0
+
+            def overlap(s: str) -> float:
+                st = set(toks(s))
+                if not st:
+                    return 0.0
+                return len(st & qt) / (len(st | qt) or 1)
+
+            def is_conversation_note(it: dict[str, Any]) -> bool:
+                tags = it.get("tags") or []
+                if isinstance(tags, list):
+                    tags_l = {str(t).lower() for t in tags}
+                    if "conversation" in tags_l or "episode_digest" in tags_l:
+                        return True
+                return False
+
+            REL = 0.35
+            n = 0
+            for k in ("notes", "evidence", "skills"):
+                items = hits.get(k) or []
+                if not isinstance(items, list):
+                    continue
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    ts = it.get("trust_score", 0.0)
+                    trust = float(ts) if isinstance(ts, (int, float)) else 0.0
+                    if trust < min_trust:
+                        continue
+                    if k == "notes" and is_conversation_note(it):
+                        continue
+                    parts: list[str] = []
+                    for f in ("title", "name", "kind", "domain", "content_snip", "snippet", "source_type"):
+                        v = it.get(f, "")
+                        if isinstance(v, str) and v:
+                            parts.append(v)
+                    rel = max((overlap(p) for p in parts), default=0.0)
+                    if rel >= REL:
+                        n += 1
+            return int(n)
 
         # Execute plan
         for step in plan.steps:
@@ -491,7 +618,7 @@ class CogOS:
                 ev = self.memory.add_evidence(
                     "note_write",
                     jdump({"note_id": nid, "title": step.title}),
-                    metadata={},
+                    metadata={"source_type": "internal", "trust_score": 0.2},
                 )
                 evidence_ids.append(ev)
                 _trace("evidence", {"evidence_id": ev, "kind": "note_write"})
@@ -507,7 +634,7 @@ class CogOS:
                 ev = self.memory.add_evidence(
                     "task_create",
                     jdump({"task_id": tid, "title": step.title}),
-                    metadata={},
+                    metadata={"source_type": "internal", "trust_score": 0.2},
                 )
                 evidence_ids.append(ev)
                 _trace("evidence", {"evidence_id": ev, "kind": "task_create"})
@@ -525,10 +652,15 @@ class CogOS:
                 memory_hits.get("notes") or memory_hits.get("evidence") or memory_hits.get("skills")
             )
             max_hit_trust = _max_hit_trust(memory_hits)
-            # Treat low-trust hits as "effectively empty" for the purpose of auto-research.
-            # This prevents the agent from skipping web_search just because it found
-            # conversation fragments or other low-trust items in memory.
-            insufficient_hits = empty_hits or (max_hit_trust < float(self.cfg.min_evidence_trust))
+            max_hit_rel = _max_hit_relevance(memory_hits, user_text)
+            eligible_hits = _eligible_hit_count(memory_hits, user_text)
+
+            # Only auto-research for non-trivial queries; avoid going online for "hi".
+            q_tokens = toks(user_text)
+            non_trivial = len(q_tokens) >= 3
+
+            # Treat low-trust OR low-relevance hits as "effectively empty" for auto-research.
+            insufficient_hits = empty_hits or (eligible_hits == 0)
             _trace(
                 "auto_research_gate",
                 {
@@ -536,11 +668,15 @@ class CogOS:
                     "had_web_search": bool(had_web_search),
                     "empty_hits": bool(empty_hits),
                     "max_hit_trust": float(max_hit_trust),
+                    "max_hit_relevance": float(max_hit_rel),
+                    "eligible_hit_count": int(eligible_hits),
+                    "token_count": int(len(q_tokens)),
                     "min_evidence_trust": float(self.cfg.min_evidence_trust),
                     "insufficient_hits": bool(insufficient_hits),
+                    "non_trivial": bool(non_trivial),
                 },
             )
-            if had_mem_search and insufficient_hits and (not had_web_search):
+            if had_mem_search and non_trivial and insufficient_hits and (not had_web_search):
                 _trace("tool_call", {"tool": "web_search", "arguments": {"query": user_text, "k": 5}})
                 out = self.tools.execute(
                     ToolCall(name="web_search", arguments={"query": user_text, "k": 5})
@@ -564,19 +700,36 @@ class CogOS:
             memory_hits=memory_hits,
             tool_outcomes=tool_outcomes,
         )
+        _trace(
+            "proposed",
+            {
+                "claim_count": int(len(getattr(proposed, "claims", []) or [])),
+                "draft": str(getattr(proposed, "draft", "") or "")[:240],
+            },
+        )
         verified = self.verifier.verify(proposed)
+        _trace("verified", cast(JsonObject, pyd_compat.model_dump(verified)))
         response = self.renderer.render(verified)
 
         # Store last trace for TUI introspection.
         try:
             self.last_trace = {
                 "plan": cast(JsonObject, pyd_compat.model_dump(plan)),
+                "events": trace_events,
+                "bus_events_turn": bus_turn_events,
+                "bus_events_recent": list(self._recent_bus_events)[-40:],
                 "tool_outcomes": [cast(JsonObject, pyd_compat.model_dump(o)) for o in tool_outcomes],
                 "evidence_ids": [str(e) for e in evidence_ids],
                 "verified": cast(JsonObject, pyd_compat.model_dump(verified)),
             }
-        except Exception:
+        except Exception:  # pylint: disable=broad-exception-caught
             self.last_trace = None
+        finally:
+            # Always detach the per-turn bus listener.
+            try:
+                self.bus.remove_listener(_record_turn_bus_event)
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
 
         # Notary: if auto-research ran and we still can't verify, cut the hard-line and escalate.
         if (

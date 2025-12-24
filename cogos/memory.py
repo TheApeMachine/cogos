@@ -781,9 +781,11 @@ class MemoryStore:
                 continue
             md = ev.get("metadata") or {}
             try:
-                trust = float(md.get("trust_score", 1.0))
+                # Default to a conservative trust when metadata is missing. Evidence
+                # without an explicit trust_score should not be treated as fully trusted.
+                trust = float(md.get("trust_score", 0.5))
             except Exception:
-                trust = 1.0
+                trust = 0.5
             out.append(
                 {
                     "id": ev["id"],

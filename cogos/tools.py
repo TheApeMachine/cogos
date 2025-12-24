@@ -632,6 +632,9 @@ def make_web_search_handler(
     allow_domains: Sequence[str] = (),
     deny_domains: Sequence[str] = (),
     provider: str = "duckduckgo_lite",
+    min_result_trust: float = 0.0,
+    enable_site_fallback: bool = True,
+    fallback_sites: Sequence[str] = ("wikipedia.org",),
     # Production safeguards (defaults are conservative and backwards-compatible)
     cache_ttl_s: float = 300.0,
     cache_max_entries: int = 256,
@@ -649,6 +652,8 @@ def make_web_search_handler(
 ) -> Callable[[WebSearchIn], WebSearchOut]:
     allow = [str(d).strip().lower() for d in allow_domains if str(d).strip()]
     deny = [str(d).strip().lower() for d in deny_domains if str(d).strip()]
+    min_result_trust = float(min_result_trust)
+    fallback_sites = [str(d).strip().lower() for d in (fallback_sites or []) if str(d).strip()]
 
     def _normalize_query(q: str) -> str:
         q = (q or "").strip()
@@ -948,27 +953,49 @@ def make_web_search_handler(
             # Preserve prior behavior: errors just yield empty results.
             raw = []
 
-        results: List[WebSearchResult] = []
-        for r in raw:
-            url = str(r.get("url") or "").strip()
-            if not url:
-                continue
-            domain = _normalize_domain(urllib.parse.urlparse(url).netloc)
-            if not _domain_allowed(domain, allow_eff, deny_eff):
-                continue
-            trust = _trust_for_domain(domain, allow_eff)
-            results.append(
-                WebSearchResult(
-                    title=str(r.get("title") or "").strip(),
-                    url=url,
-                    snippet=str(r.get("snippet") or "").strip(),
-                    domain=domain,
-                    rank=len(results) + 1,
-                    trust_score=float(trust),
+        def _filter_results(raw_items: list[dict[str, str]], *, allow_eff_: Sequence[str]) -> List[WebSearchResult]:
+            out2: List[WebSearchResult] = []
+            for r in raw_items:
+                url = str(r.get("url") or "").strip()
+                if not url:
+                    continue
+                domain = _normalize_domain(urllib.parse.urlparse(url).netloc)
+                if not _domain_allowed(domain, allow_eff_, deny_eff):
+                    continue
+                trust = float(_trust_for_domain(domain, allow_eff_))
+                if trust < min_result_trust:
+                    continue
+                out2.append(
+                    WebSearchResult(
+                        title=str(r.get("title") or "").strip(),
+                        url=url,
+                        snippet=str(r.get("snippet") or "").strip(),
+                        domain=domain,
+                        rank=len(out2) + 1,
+                        trust_score=float(trust),
+                    )
                 )
-            )
-            if len(results) >= k:
-                break
+                if len(out2) >= k:
+                    break
+            return out2
+
+        results: List[WebSearchResult] = _filter_results(raw, allow_eff_=allow_eff)
+
+        # If allow/deny + trust threshold filtered everything out, optionally fall back to
+        # targeted "site:" searches (useful for narrow allowlists).
+        if (not results) and enable_site_fallback and q_norm:
+            sites = list(allow_eff or fallback_sites)
+            for site in sites[:5]:
+                try:
+                    q2 = f"site:{site} {q_norm}"
+                    raw2 = _fetch_raw_ddg(q2, k=k * 4, timeout_s=timeout_s)
+                    # When using site:, restrict allow_eff to just that site for clean filtering.
+                    res2 = _filter_results(raw2, allow_eff_=[site])
+                    if res2:
+                        results = res2
+                        break
+                except Exception:
+                    continue
         out = WebSearchOut(query=inp.query, provider=provider_name, results=results)
         if enable_cache:
             _cache.set(ck, out)

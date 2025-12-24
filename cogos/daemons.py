@@ -121,7 +121,7 @@ class PruningDaemon(Daemon):
         evid = ctx.memory.add_evidence(
             "episodes_pruned",
             jdump({"note_id": nid, "deleted": deleted, "session_id": ctx.session_id, "range": [start_iso, end_iso]}),
-            metadata={"note_id": nid, "session_id": ctx.session_id},
+            metadata={"note_id": nid, "session_id": ctx.session_id, "source_type": "internal", "trust_score": 0.2},
             dedupe=False,
         )
         ctx.bus.publish("episodes_pruned", {"note_id": nid, "deleted": deleted, "evidence_id": evid})

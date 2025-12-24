@@ -19,7 +19,7 @@ from .util import short
 
 
 def _install_sigint_handler(stop_flag: threading.Event) -> None:
-    def _h(sig, frame):  # noqa: ARG001
+    def _h(_sig, _frame):  # noqa: ARG001
         stop_flag.set()
 
     signal.signal(signal.SIGINT, _h)
@@ -113,17 +113,18 @@ def _pretty_json_or_text(s: str) -> Tuple[str, bool]:
         return "", False
     try:
         obj = json.loads(txt)
-    except Exception:
+    except Exception:  # pylint: disable=broad-exception-caught
         return txt, False
     try:
         return json.dumps(obj, ensure_ascii=False, sort_keys=True, indent=2), True
-    except Exception:
+    except Exception:  # pylint: disable=broad-exception-caught
         return txt, True
 
 
 def cmd_chat(args: argparse.Namespace) -> int:
+    # If no allowlist is provided, allow all domains (verification/trust scoring still applies).
     if args.web_allow_domain is None:
-        web_allow_domain = ["wikipedia.org", "arxiv.org", "github.com"]
+        web_allow_domain = []
     else:
         web_allow_domain = args.web_allow_domain
 
@@ -169,6 +170,10 @@ def cmd_chat(args: argparse.Namespace) -> int:
         background=not args.no_background,
         json_logs=args.json_logs,
         log_level=args.log_level,
+        log_file="" if args.no_log_file else args.log_file,
+        log_file_level=args.log_file_level,
+        log_file_max_bytes=args.log_file_max_bytes,
+        log_file_backup_count=args.log_file_backups,
         initiative_threshold=args.initiative_threshold,
     )
 
@@ -181,7 +186,35 @@ def cmd_chat(args: argparse.Namespace) -> int:
         is_tty = sys.stdout.isatty()
         style = _Style(enabled=is_tty and (not args.no_color))
         spinner = _Spinner(enabled=is_tty and (not args.no_spinner), text="thinking")
-        show_tools = bool(args.show_tools)
+        show_tools = bool(args.show_tools or args.verbose)
+        show_events = bool(args.show_events or args.verbose)
+
+        def _evt_line(evt_type: str, payload: Dict[str, Any]) -> str:
+            # Keep these compact; /ev handles details.
+            if evt_type == "tool_executed":
+                tool = str(payload.get("tool") or "")
+                evid = str(payload.get("evidence_id") or "")
+                return f"{style.dim('•') if style.enabled else '*'} event tool_executed {tool} evidence={evid}"
+            if evt_type in ("note_added", "task_added", "episodes_pruned"):
+                return f"{style.dim('•') if style.enabled else '*'} event {evt_type} {payload}"
+            return f"{style.dim('•') if style.enabled else '*'} event {evt_type}"
+
+        def _on_bus_event(evt: Any) -> None:
+            nonlocal show_events
+            if not show_events:
+                return
+            # Avoid duplicating the per-turn tool trace when show_tools is enabled.
+            if show_tools and getattr(evt, "type", "") == "tool_executed":
+                return
+            try:
+                line = _evt_line(str(evt.type), dict(evt.payload))
+            except Exception:  # pylint: disable=broad-exception-caught
+                line = f"{style.dim('•') if style.enabled else '*'} event (unprintable)"
+            spinner.println(line)
+
+        # Tap the bus so we can show daemon activity (note linking/pruning/etc.) without
+        # stealing events from the background runner.
+        agent.bus.add_listener(_on_bus_event)
 
         print(style.dim("—" * 72))
         print(
@@ -224,6 +257,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 print("  /ev <evidence_id> [full]    show evidence content")
                 print("  /trace               show last plan + tool outcomes")
                 print("  /show tools          toggle tool-call tracing")
+                print("  /show events         toggle background event tracing")
                 print("  /quit                exit")
                 continue
 
@@ -288,8 +322,11 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 if rest in ("tools", "tool", "trace"):
                     show_tools = not show_tools
                     print(f"show_tools={show_tools}")
+                elif rest in ("events", "event"):
+                    show_events = not show_events
+                    print(f"show_events={show_events}")
                 else:
-                    print("Usage: /show tools")
+                    print("Usage: /show tools | /show events")
                 continue
 
             if user.startswith("/ev ") or user.startswith("/evidence "):
@@ -308,7 +345,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 print(style.bold(hdr) if style.enabled else hdr)
                 try:
                     ts = float(md.get("trust_score", 0.0))
-                except Exception:
+                except Exception:  # pylint: disable=broad-exception-caught
                     ts = 0.0
                 src = str(md.get("source_type", md.get("tool", "")) or "")
                 meta_line = f"source={src} trust_score={ts:.2f}" if src else f"trust_score={ts:.2f}"
@@ -372,6 +409,41 @@ def cmd_chat(args: argparse.Namespace) -> int:
                         print(f"    text: {short(txt, 180)}")
                         if spans:
                             print(f"    spans: {spans}")
+                # Internal trace events (auto-research gate, etc.)
+                evts = tr.get("events") or []
+                if isinstance(evts, list) and evts:
+                    hdr = "trace events:"
+                    print(style.bold(hdr) if style.enabled else hdr)
+                    for e in evts[-12:]:
+                        if not isinstance(e, dict):
+                            continue
+                        kind = e.get("kind")
+                        payload = e.get("payload")
+                        if kind == "auto_research_gate":
+                            print(f"  - auto_research {payload}")
+
+                # Background daemon/event bus activity.
+                bus_turn = tr.get("bus_events_turn") or []
+                if isinstance(bus_turn, list) and bus_turn:
+                    hdr = "bus events (during last turn):"
+                    print(style.bold(hdr) if style.enabled else hdr)
+                    for e in bus_turn[-12:]:
+                        if not isinstance(e, dict):
+                            continue
+                        et = e.get("type")
+                        pl = e.get("payload")
+                        print(f"  - {et} {pl}")
+
+                bus_recent = tr.get("bus_events_recent") or []
+                if isinstance(bus_recent, list) and bus_recent:
+                    hdr = "bus events (recent):"
+                    print(style.bold(hdr) if style.enabled else hdr)
+                    for e in bus_recent[-8:]:
+                        if not isinstance(e, dict):
+                            continue
+                        et = e.get("type")
+                        pl = e.get("payload")
+                        print(f"  - {et} {pl}")
                 if not steps and not outs:
                     print("(no trace available yet)")
                 continue
@@ -398,7 +470,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
             try:
                 spinner.start()
                 ans, proactive = agent.handle(user, on_trace=_on_trace)
-            except Exception as e:
+            except Exception as e:  # pylint: disable=broad-exception-caught
                 spinner.stop()
                 if style.enabled:
                     print(style.cyan("bot> ") + style.red(f"ERROR: {e}"))
@@ -481,7 +553,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         if tmp_path:
             try:
                 os.remove(tmp_path)
-            except Exception:
+            except Exception:  # pylint: disable=broad-exception-caught
                 pass
 
 
@@ -541,7 +613,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--web-allow-domain",
         action="append",
         default=None,
-        help="Allowlist domains for web_search (repeatable).",
+        help="Allowlist domains for web_search (repeatable). If omitted, all domains are allowed (trust scoring + verifier still apply).",
     )
     chat.add_argument(
         "--web-deny-domain",
@@ -583,10 +655,35 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--no-background", action="store_true")
 
     chat.add_argument("--log-level", default="INFO")
+    chat.add_argument(
+        "--log-file",
+        default=os.environ.get("COGOS_LOG_FILE", "cogos.log"),
+        help="Write full logs to this file (rotated). Use --no-log-file to disable.",
+    )
+    chat.add_argument(
+        "--log-file-level",
+        default=os.environ.get("COGOS_LOG_FILE_LEVEL", "DEBUG"),
+        help="Minimum level written to --log-file (default: DEBUG).",
+    )
+    chat.add_argument(
+        "--log-file-max-bytes",
+        type=int,
+        default=int(os.environ.get("COGOS_LOG_FILE_MAX_BYTES", "10000000")),
+        help="Rotate log file after this many bytes (default: 10_000_000).",
+    )
+    chat.add_argument(
+        "--log-file-backups",
+        type=int,
+        default=int(os.environ.get("COGOS_LOG_FILE_BACKUPS", "3")),
+        help="Number of rotated log backups to keep (default: 3).",
+    )
+    chat.add_argument("--no-log-file", action="store_true", help="Disable file logging.")
     chat.add_argument("--json-logs", action="store_true")
     chat.add_argument("--no-color", action="store_true", help="Disable ANSI colors.")
     chat.add_argument("--no-spinner", action="store_true", help="Disable the in-progress spinner.")
     chat.add_argument("--show-tools", action="store_true", help="Show tool calls/outcomes for each turn.")
+    chat.add_argument("--show-events", action="store_true", help="Show background daemon/event activity.")
+    chat.add_argument("--verbose", action="store_true", help="Enable a more verbose trace mode (tools + events).")
 
     chat.set_defaults(func=cmd_chat)
 

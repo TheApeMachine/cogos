@@ -68,13 +68,14 @@ class Verifier:
                 else c.copy(update={"status": "rejected", "score": 0.0})
             )  # type: ignore
 
-        # Critical: spans must also appear in the claim text itself.
+        # Critical: spans must be relevant to the claim.
         #
-        # Otherwise a model can "launder" an unsupported claim by citing arbitrary
-        # substrings that happen to exist in evidence (e.g. JSON keys), while the
-        # claim text says something else entirely.
-        claim_txt = str(c.text or "")
-        if spans and any(sp not in claim_txt for sp in spans):
+        # We *cannot* require spans to appear in the claim text verbatim (claims often
+        # paraphrase quotes). Instead we require meaningful token overlap between the
+        # claim text and each cited span. This blocks "span laundering" where a model
+        # cites arbitrary substrings (e.g. JSON keys) unrelated to the claim.
+        claim_tokens = set(toks(c.text or ""))
+        if self.require_spans and not claim_tokens:
             return (
                 c.model_copy(update={"status": "rejected", "score": 0.0})
                 if hasattr(c, "model_copy")
@@ -87,6 +88,22 @@ class Verifier:
             if found:
                 hit += 1
         span_hit_rate = hit / max(1, len(spans))
+
+        # Span-claim overlap (token-level)
+        overlap_ok = True
+        overlap_scores: List[float] = []
+        for sp in spans:
+            st = set(toks(sp or ""))
+            if not st:
+                overlap_ok = False
+                overlap_scores.append(0.0)
+                continue
+            inter = len(st & claim_tokens)
+            # Normalize by claim length (claim is usually short).
+            score = inter / (len(claim_tokens) or 1)
+            overlap_scores.append(float(score))
+            if inter < 1:
+                overlap_ok = False
 
         # Numeric grounding
         nums = self._numbers(c.text)
@@ -104,8 +121,9 @@ class Verifier:
         j = len(ct & et) / (len(ct | et) or 1)
 
         # Score and decision
-        score = 0.65 * span_hit_rate + 0.20 * (1.0 if num_ok else 0.0) + 0.15 * j
-        ok = (span_hit_rate >= self.min_span_hits) and num_ok
+        overlap_mean = sum(overlap_scores) / max(1, len(overlap_scores))
+        score = 0.55 * span_hit_rate + 0.20 * overlap_mean + 0.15 * (1.0 if num_ok else 0.0) + 0.10 * j
+        ok = (span_hit_rate >= self.min_span_hits) and overlap_ok and num_ok
 
         status = "verified" if ok else "rejected"
         updated = {"status": status, "score": float(score)}
